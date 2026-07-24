@@ -253,8 +253,8 @@ button{font-family:inherit;}
 .moveStyleBtn{height:28px;padding:0 9px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.05);color:#cfd4da;border-radius:6px;font-size:11px;cursor:pointer;}
 .moveStyleBtn.active{background:#818cf8;border-color:#818cf8;color:#fff;}
 #applySimplifyBtn{height:30px;padding:0 12px;border:none;background:#818cf8;color:#fff;border-radius:7px;font-size:11.5px;font-weight:600;cursor:pointer;}
-#applySimplifyBtn:disabled{opacity:.35;cursor:default;}
-#clearVertexSelectionBtn{height:30px;padding:0 10px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);color:#cfd4da;border-radius:7px;font-size:11.5px;cursor:pointer;}
+#applySimplifyBtn:disabled,#toggleVertexPathBtn:disabled{opacity:.35;cursor:default;}
+#clearVertexSelectionBtn,#toggleVertexPathBtn{height:30px;padding:0 10px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);color:#cfd4da;border-radius:7px;font-size:11.5px;cursor:pointer;}
 
 
 /* 이미지 목록 */
@@ -366,7 +366,7 @@ button{font-family:inherit;}
       </div>
 
       <div id="vertexRangeHint">
-        <div id="vertexRangeLabel">Shift를 누른 채 시작 vertex와 끝 vertex를 선택하세요</div>
+        <div id="vertexRangeLabel">시작 vertex를 클릭하세요</div>
         <div class="hintSep"></div>
         <div id="vertexRangeCount" class="mono">0개 선택</div>
         <div id="multiMoveControls">
@@ -378,6 +378,7 @@ button{font-family:inherit;}
           <span>시작점 + 중간점 + 끝점</span>
           <button id="applySimplifyBtn">3개 vertex로 단순화</button>
         </div>
+        <button id="toggleVertexPathBtn" title="시작-끝 사이 반대쪽 경로로 전환합니다">↔ 반대 구간</button>
         <button id="clearVertexSelectionBtn">선택 해제</button>
       </div>
 
@@ -720,6 +721,9 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   /* ---------- localStorage ---------- */
   const LS_KEY = 'burnReview_annotations_v1';
 
+  // 검수자가 명시적으로 판단을 내린 상태 — 이후 폴리곤 편집(autosave)이 이 값을 되돌리면 안 됨
+  const REVIEW_DECIDED_STATUSES = ['review_complete', 'clinician_review', 'clinician_complete', 'rework_required', 'excluded'];
+
   /* ---------- 전역 상태 ---------- */
   const state = {
     woundIds: [],            // 이미지가 매칭된 wound_id 목록 (정렬됨)
@@ -845,7 +849,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     vertexRangeHint: $('vertexRangeHint'), vertexRangeLabel: $('vertexRangeLabel'), vertexRangeCount: $('vertexRangeCount'),
     simplifyControls: $('simplifyControls'),
     multiMoveControls: $('multiMoveControls'), uniformMoveBtn: $('uniformMoveBtn'), softMoveBtn: $('softMoveBtn'),
-    applySimplifyBtn: $('applySimplifyBtn'), clearVertexSelectionBtn: $('clearVertexSelectionBtn'),
+    applySimplifyBtn: $('applySimplifyBtn'), clearVertexSelectionBtn: $('clearVertexSelectionBtn'), toggleVertexPathBtn: $('toggleVertexPathBtn'),
     overlayToggle: $('overlayToggle'), overlayToggleText: $('overlayToggleText'),
     opacitySlider: $('opacitySlider'), opacityVal: $('opacityVal'),
     viewport: $('viewport'), stage: $('stage'), stageInner: $('stageInner'), stageImg: $('stageImg'), stageSvg: $('stageSvg'),
@@ -1541,7 +1545,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       (state.imagesByWound[wid] || []).forEach((f, ii) => {
         const id = imageIdFromFilename(f.name);
         const ann = state.annotations[id] || {};
-        const complete = ann.status === 'annotated' || ann.review_flag === 'excluded';
+        const complete = REVIEW_DECIDED_STATUSES.includes(ann.status) || ann.review_flag === 'excluded';
         items.push({ id, wid, wi, ii, complete });
       });
     });
@@ -2304,8 +2308,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       for (let i = 0; i < sel.points.length; i++) {
         const [vx, vy] = sel.points[i];
         if (Math.hypot(vx - ix, vy - iy) < tol) {
-          // 구간 모드에서 Shift+클릭은 pointerup에서 범위 선택으로 처리
-          if ((state.mode === 'multi' || state.mode === 'simplify') && e.shiftKey) return;
+          // 구간 모드에서도 드래그 시작은 그대로 둠 — 실제로 움직이지 않은 클릭(탭)은
+          // pointerup에서 범위 선택으로 처리됨 (Shift 불필요, 태블릿 터치/펜 대응)
           const moveIndices = state.mode === 'multi' && state.selectedVertexIndices.includes(i)
             ? state.selectedVertexIndices.slice() : [i];
           let weights = moveIndices.map(() => 1);
@@ -2363,8 +2367,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     if (state.panStart) { state.panStart = null; el.viewport.classList.remove('panning'); }
 
     if (mouseDownInfo && !mouseDownInfo.moved && (state.mode === 'select' || state.mode === 'multi' || state.mode === 'simplify') && !state.spacePan) {
-      // 구간 모드의 Shift+vertex 클릭 -> 시작/끝 범위 선택
-      if ((state.mode === 'multi' || state.mode === 'simplify') && e.shiftKey) {
+      // 구간 모드의 vertex 클릭(드래그 없이 탭/클릭만) -> 시작/끝 범위 선택 (Shift 불필요)
+      if (state.mode === 'multi' || state.mode === 'simplify') {
         const sel=state.rois.find(r=>r.id===state.selectedId);
         if(sel){ const tol=12/state.zoom; let hitVertex=-1; for(let i=0;i<sel.points.length;i++){ if(Math.hypot(sel.points[i][0]-mouseDownInfo.ix,sel.points[i][1]-mouseDownInfo.iy)<tol){hitVertex=i;break;} }
           if(hitVertex>=0){ chooseVertexRange(hitVertex); mouseDownInfo=null; return; }
@@ -2767,7 +2771,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       const ann = state.annotations[imgId] = state.annotations[imgId] || {};
       ann.wound_id = currentWoundId();
       ann.rois = JSON.parse(JSON.stringify(state.rois));
-      if (ann.status !== 'annotated' && ann.review_flag !== 'excluded') {
+      if (!REVIEW_DECIDED_STATUSES.includes(ann.status) && ann.review_flag !== 'excluded') {
         ann.status = ann.rois.length > 0 ? 'in_progress' : 'not_started';
       }
       if (ann.review_flag !== 'excluded') {
@@ -2805,7 +2809,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       const ann = state.annotations[imgId] = state.annotations[imgId] || {};
       ann.wound_id = currentWoundId();
       ann.rois = JSON.parse(JSON.stringify(state.rois));
-      ann.status = 'annotated';
+      // 검수 판단(검수통과/의료진검토/재작업/제외 등)은 별도 버튼에서 결정되므로 여기서 덮어쓰지 않음
+      if (!REVIEW_DECIDED_STATUSES.includes(ann.status)) {
+        ann.status = ann.rois.length > 0 ? 'in_progress' : 'not_started';
+      }
       if (ann.review_flag !== 'excluded') ann.review_flag = computeAutoReviewFlag(ann.rois);
       if (!ann.image_meta) ann.image_meta = null;
       persistAllAnnotations();
@@ -2818,7 +2825,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   function updateProgress() {
     const total = state.woundIds.length;
     const annotatedWids = new Set(
-      Object.values(state.annotations).filter((a) => a.status === 'annotated').map((a) => a.wound_id)
+      Object.values(state.annotations).filter((a) => REVIEW_DECIDED_STATUSES.includes(a.status)).map((a) => a.wound_id)
     );
     const done = state.woundIds.filter((wid) => annotatedWids.has(wid)).length;
     el.progCur.textContent = done;
@@ -3108,7 +3115,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     ann.wound_id = currentWoundId();
     ann.review_flag = 'excluded';
     ann.exclusion_reason = el.exclusionReasonSelect.value;
-    ann.status = 'annotated';
+    ann.status = 'excluded';
     ann.rois = [];   // 제외 이미지에는 폴리곤 보관하지 않음
     state.rois = []; // 화면에서도 즉시 제거
     state.selectedId = null;
@@ -3179,6 +3186,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   });
 
   el.clearVertexSelectionBtn.onclick = () => clearVertexRangeSelection();
+  el.toggleVertexPathBtn.onclick = () => toggleVertexPath();
   el.uniformMoveBtn.onclick = () => { state.multiMoveStyle = 'uniform'; renderAll(); };
   el.softMoveBtn.onclick = () => { state.multiMoveStyle = 'soft'; renderAll(); };
   el.applySimplifyBtn.onclick = applySelectedRangeSimplification;
@@ -3201,7 +3209,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     el.softMoveBtn.classList.toggle('active', state.multiMoveStyle === 'soft');
     const nSel=state.selectedVertexIndices.length;
     el.vertexRangeCount.textContent=nSel ? `${nSel}개 선택` : '0개 선택';
-    el.vertexRangeLabel.textContent = !state.selectedId ? '먼저 ROI를 선택하세요' : state.vertexAnchor===null ? 'Shift + 시작 vertex를 클릭하세요' : nSel<=1 ? 'Shift + 끝 vertex를 클릭하세요' : (state.mode==='multi' ? '선택된 vertex를 드래그하세요 · Tab으로 반대 구간 전환' : 'Tab으로 반대 구간 전환 · 시작점+중간점+끝점 3개로 단순화');
+    el.vertexRangeLabel.textContent = !state.selectedId ? '먼저 ROI를 선택하세요' : state.vertexAnchor===null ? '시작 vertex를 클릭하세요' : nSel<=1 ? '끝 vertex를 클릭하세요' : (state.mode==='multi' ? '선택된 vertex를 드래그하세요' : '시작점 + 중간점 + 끝점 3개로 단순화');
+    el.toggleVertexPathBtn.disabled = !(rangeMode && state.vertexAnchor !== null && state.vertexRangeEnd !== null);
     el.applySimplifyBtn.disabled = !(state.mode==='simplify' && nSel>=3);
     el.undoBtn.disabled = !(state.history.length || (state.mode === 'draw' && state.draft.length));
     el.redoBtn.disabled = !state.future.length;
