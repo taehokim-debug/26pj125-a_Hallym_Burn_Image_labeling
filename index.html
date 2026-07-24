@@ -2,6 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>화상 폴리곤 검수 도구 (의료진용) v1.2</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -19,7 +20,7 @@ html,body{height:100%;}
 body{font-family:-apple-system,BlinkMacSystemFont,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;color:#22262c;overflow:hidden;}
 .mono{font-family:'JetBrains Mono',monospace;}
 button{font-family:inherit;}
-#app{height:100vh;display:flex;flex-direction:column;background:#fff;}
+#app{height:100vh;height:100dvh;display:flex;flex-direction:column;background:#fff;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);}
 
 /* ===== TOP BAR ===== */
 #topbar{height:54px;flex:none;background:#fff;border-bottom:1px solid #e2e5e9;display:flex;align-items:center;padding:0 18px;gap:18px;z-index:5;}
@@ -2942,13 +2943,17 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   el.exportJsonBtn.onclick = () => {
     const entry = buildCurrentJsonEntry();
     if (!entry) { alert('현재 저장할 이미지가 없습니다.'); return; }
+    if (!REVIEW_DECIDED_STATUSES.includes(entry.status)) {
+      alert('아직 미검수 상태입니다.\n검수통과/의료진검토/재작업/제외 중 하나로 처리한 뒤 다운로드해 주세요.');
+      return;
+    }
     downloadText(entry.id + '.json', JSON.stringify(entry, null, 1), 'application/json');
   };
   el.exportZipBtn.onclick = async () => {
     flushPendingSave();
     const all = buildJsonEntries();
-    const reviewed = all.filter(e => state.annotations[e.id]?.clinician_reviewed);
-    const skipped  = all.filter(e => !state.annotations[e.id]?.clinician_reviewed);
+    const reviewed = all.filter(e => REVIEW_DECIDED_STATUSES.includes(e.status));
+    const skipped  = all.filter(e => !REVIEW_DECIDED_STATUSES.includes(e.status));
     if (!reviewed.length) { alert('검수 완료된 항목이 없습니다.\n검수통과/검토필요/제외 중 하나를 선택한 항목만 포함됩니다.'); return; }
     const zip = new JSZip();
     reviewed.forEach((entry) => zip.file(entry.id + '.json', JSON.stringify(entry, null, 1)));
