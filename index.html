@@ -2890,7 +2890,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         exclusion_reason: ann.exclusion_reason || null,
         review_source: ann.review_source || null,
         rework_reason: ann.rework_reason || null,
-        review_comment: ann.review_comment || null,
+        review_comment: (ann.review_comment && ann.review_comment.trim()) || null,
         image_meta: ann.image_meta || null,
         meta: {
           sex: c.sex ?? null, age: c.age ?? null, burn_cause: c.burn_cause ?? null,
@@ -3325,8 +3325,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const reasonSel = document.getElementById('reworkReason');
     const commentTa = document.getElementById('reworkComment');
     if (reworkSection) reworkSection.style.display = active ? 'block' : 'none';
-    if (reasonSel) reasonSel.value = (ann && ann.rework_reason) || '';
-    if (commentTa) commentTa.value = (ann && ann.review_comment) || '';
+    if (reasonSel && document.activeElement !== reasonSel) reasonSel.value = (ann && ann.rework_reason) || '';
+    if (commentTa && document.activeElement !== commentTa) commentTa.value = (ann && ann.review_comment) || '';
   }
 
   // 검수 버튼 이벤트
@@ -3365,7 +3365,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     ann.review_source = 'secondary_reviewer';
     ann.clinician_reviewed = true;
     ann.rework_reason = _reworkReason ? (_reworkReason.value || null) : null;
-    ann.review_comment = _reworkComment ? (_reworkComment.value.trim() || null) : null;
+    ann.review_comment = _reworkComment ? (_reworkComment.value || null) : null;
     persistAllAnnotations();
     renderReviewPanel();
     updateProgress();
