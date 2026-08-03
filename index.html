@@ -1150,8 +1150,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
 
   function currentFinalDepthParts() {
-    const w = getWoundMetaForImage(currentImageId() || currentWoundId()).wound;
-    return String(w.final_depth || '').split('+').map(s => s.trim()).filter(Boolean);
+    const finalDepth = getEffectiveMetaForDisplay(currentImageId()).final_depth;
+    return String(finalDepth || '').split('+').map(s => s.trim()).filter(Boolean);
   }
   function isCompoundDepth() { return currentFinalDepthParts().length > 1; }
   function candidateKey(th, idx) { return `${th}:${idx}`; }
@@ -1535,6 +1535,23 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const wid = resolveWoundIdForImage(imageId);
     return { woundId: wid, wound: wid ? (WOUNDS[wid] || {}) : {} };
   }
+  // 엑셀이 로드되어 있으면 그 값(참고용, 화면 표시 전용)을 우선 쓰고,
+  // 없으면 JSON 로드 시 같이 들어온 1차 작업 meta로 대체 (표시만, 저장 로직과는 무관)
+  function getEffectiveMetaForDisplay(imageId) {
+    const wid = resolveWoundIdForImage(imageId);
+    const w = wid ? (WOUNDS[wid] || null) : null;
+    if (w) {
+      const c = CASES[w.case_id] || {};
+      return {
+        sex: c.sex ?? null, age: c.age ?? null, burn_cause: c.burn_cause ?? null,
+        body_site: w.body_site ?? null, healed_within_21d: w.healed_within_21d ?? null,
+        surgery: w.surgery ?? null, final_depth: w.final_depth ?? null,
+      };
+    }
+    const ann = imageId ? state.annotations[imageId] : null;
+    if (ann && ann.meta && typeof ann.meta === 'object') return ann.meta;
+    return { sex: null, age: null, burn_cause: null, body_site: null, healed_within_21d: null, surgery: null, final_depth: null };
+  }
   function currentImageId() {
     const f = currentImageFile();
     return f ? imageIdFromFilename(f.name) : null;
@@ -1729,23 +1746,22 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   }
 
   function renderMeta(wid) {
-    const meta = getWoundMetaForImage(currentImageId() || wid);
-    const w = meta.wound;
-    const c = CASES[w.case_id] || {};
+    const imgId = currentImageId();
+    const em = getEffectiveMetaForDisplay(imgId || wid);
     const compound = isCompoundDepth();
-    const bodySite = humanize('body_site', w.body_site);
-    const finalDepth = humanize('plain', w.final_depth);
+    const bodySite = humanize('body_site', em.body_site);
+    const finalDepth = humanize('plain', em.final_depth);
     const typeBadge = `<span class="depthTypeBadge ${compound ? 'compound' : 'single'}">${compound ? '복합 상처' : '단일 상처'}</span>`;
     el.metaHighlight.innerHTML = `
       <div class="metaHiRow"><span class="metaHiLabel">신체 부위</span><span class="metaHiValue">${escapeHtml(bodySite)}</span></div>
       <div class="metaHiRow"><span class="metaHiLabel">최종 화상 깊이</span><span class="metaHiValue">${escapeHtml(finalDepth)} ${typeBadge}</span></div>
     `;
     const rows = [
-      ['성별', humanize('sex', c.sex)],
-      ['나이', c.age != null ? c.age + '세' : '-'],
-      ['화상 원인', humanize('burn_cause', c.burn_cause)],
-      ['21일 이내 치유', humanize('yn', w.healed_within_21d)],
-      ['수술 여부', humanize('yn', w.surgery)],
+      ['성별', humanize('sex', em.sex)],
+      ['나이', em.age != null ? em.age + '세' : '-'],
+      ['화상 원인', humanize('burn_cause', em.burn_cause)],
+      ['21일 이내 치유', humanize('yn', em.healed_within_21d)],
+      ['수술 여부', humanize('yn', em.surgery)],
     ];
     el.metaCard.innerHTML = rows.map(([k, v]) =>
       `<div class="cardRow"><span class="k">${escapeHtml(k)}</span><span class="v">${escapeHtml(v)}</span></div>`
@@ -2918,6 +2934,13 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
       const status = ann.status === 'not_started' ? 'pending' : (ann.status || 'pending');
 
+      const importedMeta = (ann.meta && typeof ann.meta === 'object') ? ann.meta : null;
+      const meta = importedMeta || {
+        sex: c.sex ?? null, age: c.age ?? null, burn_cause: c.burn_cause ?? null,
+        body_site: w.body_site ?? null, healed_within_21d: w.healed_within_21d ?? null,
+        surgery: w.surgery ?? null, final_depth: w.final_depth ?? null,
+      };
+
       return {
         id: imgId,
         wound_id: wid,
@@ -2929,11 +2952,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         rework_reason: ann.rework_reason || null,
         review_comment: (ann.review_comment && ann.review_comment.trim()) || null,
         image_meta: ann.image_meta || null,
-        meta: {
-          sex: c.sex ?? null, age: c.age ?? null, burn_cause: c.burn_cause ?? null,
-          body_site: w.body_site ?? null, healed_within_21d: w.healed_within_21d ?? null,
-          surgery: w.surgery ?? null, final_depth: w.final_depth ?? null,
-        },
+        meta,
         content,
       };
     });
@@ -2949,6 +2968,12 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       const rois = normalizedClone(ann.rois || []);
       const labelIds = buildLabelIds(rois);
       const status = ann.status === 'not_started' ? 'pending' : (ann.status || 'pending');
+      const importedMeta = (ann.meta && typeof ann.meta === 'object') ? ann.meta : null;
+      const meta = importedMeta || {
+        sex: c.sex ?? null, age: c.age ?? null, burn_cause: c.burn_cause ?? null,
+        body_site: w.body_site ?? null, healed_within_21d: w.healed_within_21d ?? null,
+        surgery: w.surgery ?? null, final_depth: w.final_depth ?? null,
+      };
       rois.forEach((r) => {
         const labelId = labelIds[r.id] || r.id;
         const parentLabelId = r.parent ? (labelIds[r.parent] || r.parent) : '';
@@ -2958,9 +2983,9 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           id: imgId, wound_id: wid, case_id: w.case_id || '',
           status, review_flag: ann.review_flag || '',
           exclusion_reason: ann.exclusion_reason || '',
-          sex: c.sex || '', age: c.age || '', burn_cause: c.burn_cause || '',
-          body_site: w.body_site || '', healed_within_21d: w.healed_within_21d || '',
-          surgery: w.surgery || '', final_depth_wound_level: w.final_depth || '',
+          sex: meta.sex || '', age: meta.age || '', burn_cause: meta.burn_cause || '',
+          body_site: meta.body_site || '', healed_within_21d: meta.healed_within_21d || '',
+          surgery: meta.surgery || '', final_depth_wound_level: meta.final_depth || '',
           label_id: labelId, name: r.name, roiType: r.roiType, parent: parentLabelId,
           depth: r.depth || '',
           unc_boundary: isIgnore ? '' : (unc.boundary || 'low'),
