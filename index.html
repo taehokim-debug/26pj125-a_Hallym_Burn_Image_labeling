@@ -746,6 +746,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     currentIndex: -1,
     imagesByWound: {},        // wound_id -> [File, ...]
     rawImageFiles: [],        // 폴더 선택 시 원본 File 목록 (엑셀 재로드 시 재매칭용)
+    jsonLoadedIds: new Set(), // 지금 세션에서 JSON으로 실제 불러온 이미지 id 집합 (요검토 범위 한정용)
     currentImageIndex: 0,
     annotations: loadAllAnnotations(), // wound_id -> { rois:[...], done:bool }
     zoom: 1, panX: 0, panY: 0,
@@ -1530,6 +1531,26 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       const w = normalizeMatchId(wid);
       return normalized === w || normalized.startsWith(w + '_') || normalized.startsWith(w + '-');
     }) || null;
+  }
+  // wound_id 값이 실제 엑셀(WOUNDS)에 존재하는 유효한 값인지 검증합니다.
+  // 과거 어느 시점에 잘못된 값(예: 이미지 id)이 wound_id 자리에 저장된 채로 불러오고
+  // 내보내기를 반복하면 아무도 재검증하지 않아 계속 그대로 전달되는 문제가 있어서,
+  // 불러올 때와 내보낼 때 모두 이 함수로 재검증합니다.
+  function pickValidWoundId(candidate, imageId) {
+    const validIds = Object.keys(WOUNDS || {});
+    if (candidate && validIds.length && validIds.includes(candidate)) return candidate;
+    if (candidate && !validIds.length && candidate !== imageId) return candidate; // 검증 불가하지만 이상 신호는 없음
+    // "wound_id가 이미지 id와 완전히 같다" = 과거에 이미지 id가 잘못 들어간 전형적인 패턴.
+    // 파일명 규칙(wound_id + "_IMG" + 번호)을 이용해 엑셀 없이도 구조적으로 복원 시도.
+    const structural = String(imageId).replace(/_IMG\d+$/i, '');
+    if (structural && structural !== imageId) return structural;
+    return resolveWoundIdForImage(imageId) || candidate || '';
+  }
+  // case_id는 wound_id 안에 이미 포함된 정보(C0005_W01 → C0005)라서,
+  // 엑셀이 없어도(=WOUNDS[wid].case_id를 못 구해도) wound_id에서 구조적으로 뽑아낼 수 있음
+  function deriveCaseIdFromWoundId(wid) {
+    const m = String(wid || '').match(/^(.+)_W\d+$/i);
+    return m ? m[1] : '';
   }
   function getWoundMetaForImage(imageId) {
     const wid = resolveWoundIdForImage(imageId);
@@ -2905,7 +2926,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   function buildJsonEntries() {
     return getCurrentProjectImageIds().filter((imgId) => state.annotations[imgId]).map((imgId) => {
       const ann = state.annotations[imgId];
-      const wid = ann.wound_id || '';
+      const wid = pickValidWoundId(ann.wound_id, imgId);
       const w = WOUNDS[wid] || {};
       const c = CASES[w.case_id] || {};
       const rois = normalizedClone(ann.rois || []);
@@ -2944,7 +2965,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       return {
         id: imgId,
         wound_id: wid,
-        case_id: w.case_id || '',
+        case_id: w.case_id || deriveCaseIdFromWoundId(wid),
         status,
         review_flag: ann.review_flag || null,
         exclusion_reason: ann.exclusion_reason || null,
@@ -2962,7 +2983,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const rows = [];
     getCurrentProjectImageIds().filter((imgId) => state.annotations[imgId]).forEach((imgId) => {
       const ann = state.annotations[imgId];
-      const wid = ann.wound_id || '';
+      const wid = pickValidWoundId(ann.wound_id, imgId);
       const w = WOUNDS[wid] || {};
       const c = CASES[w.case_id] || {};
       const rois = normalizedClone(ann.rois || []);
@@ -2980,7 +3001,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         const isIgnore = r.roiType === 'Ignore';
         const unc = (r.unc && typeof r.unc === 'object') ? r.unc : {};
         rows.push({
-          id: imgId, wound_id: wid, case_id: w.case_id || '',
+          id: imgId, wound_id: wid, case_id: w.case_id || deriveCaseIdFromWoundId(wid),
           status, review_flag: ann.review_flag || '',
           exclusion_reason: ann.exclusion_reason || '',
           sex: meta.sex || '', age: meta.age || '', burn_cause: meta.burn_cause || '',
@@ -3115,7 +3136,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return { count, maxSeverity };
   }
   function getReviewList() {
+    // localStorage 전체가 아니라, 지금 세션에서 JSON으로 실제 불러온 이미지만 대상으로 함
+    // (헷갈림 방지 — 예전에 저장돼 있던 다른 케이스 데이터가 섞여 보이지 않도록)
     return Object.entries(state.annotations)
+      .filter(([id]) => state.jsonLoadedIds.has(id))
       .map(([id, a]) => Object.assign({ id }, computeUncSeverity(a)))
       .filter((item) => item.count > 0)
       .sort((a, b) => (b.maxSeverity === 'high') - (a.maxSeverity === 'high'));
@@ -3692,12 +3716,13 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         data.rois = data.rois || [];
         const prev = state.annotations[imgId] || {};
         const resolvedWoundId = resolveWoundIdForImage(imgId);
+        const candidateWoundId = resolvedWoundId || data.wound_id || prev.wound_id || '';
         const newFingerprint = computeFingerprint(data.rois);
         const isModified = !!prev._fingerprint && prev._fingerprint !== newFingerprint;
         state.annotations[imgId] = Object.assign({}, prev, data, {
           id: imgId,
           image_id: imgId,
-          wound_id: resolvedWoundId || data.wound_id || '',
+          wound_id: pickValidWoundId(candidateWoundId, imgId),
           clinician_reviewed: isModified ? false : (prev.clinician_reviewed || data.clinician_reviewed || false),
           status: isModified ? 'pending' : (prev.status || data.status || 'pending'),
           review_flag: isModified ? null : (prev.review_flag != null ? prev.review_flag : (data.review_flag || null)),
@@ -3709,6 +3734,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           _modified: isModified,
         });
         matched++;
+        state.jsonLoadedIds.add(imgId);
       } catch(err) {
         failed++;
         console.warn('JSON 로드 오류:', f.name, err.message);
@@ -3809,6 +3835,13 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   renderSosPanel();
   updateProgress();
   renderAll();
+
+  // 디버깅용: 콘솔에서 window.__debug.state / .WOUNDS / .CASES 로 내부 상태 확인 가능
+  window.__debug = {
+    get state() { return state; },
+    get WOUNDS() { return WOUNDS; },
+    get CASES() { return CASES; },
+  };
 })();
 
 </script>
