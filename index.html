@@ -746,7 +746,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     currentIndex: -1,
     imagesByWound: {},        // wound_id -> [File, ...]
     rawImageFiles: [],        // 폴더 선택 시 원본 File 목록 (엑셀 재로드 시 재매칭용)
-    jsonLoadedIds: new Set(), // 지금 세션에서 JSON으로 실제 불러온 이미지 id 집합 (요검토 범위 한정용)
+    allWoundIds: [],          // 이미지 폴더에서 매칭된 전체 이미지 id 목록 (JSON 필터와 무관하게 항상 보존)
+    jsonLoadedIds: new Set(), // 지금 세션에서 JSON으로 실제 불러온 이미지 id 집합 (요검토 범위 + 작업 목록 필터 공용)
     currentImageIndex: 0,
     annotations: loadAllAnnotations(), // wound_id -> { rois:[...], done:bool }
     zoom: 1, panX: 0, panY: 0,
@@ -990,6 +991,21 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     e.target.value = '';
   };
 
+  // JSON이 하나라도 불러와져 있으면, 작업 목록/이동 대상을 그 이미지들로만 제한합니다.
+  // (버튼 없이 항상 자동 적용 — JSON을 아직 안 불러왔으면 전체가 그대로 대상)
+  function applyJsonMatchFilter() {
+    const currentId = (state.currentIndex >= 0 && state.woundIds[state.currentIndex]) || null;
+    const base = state.allWoundIds.length ? state.allWoundIds : state.woundIds;
+    state.woundIds = state.jsonLoadedIds.size
+      ? base.filter((id) => state.jsonLoadedIds.has(id))
+      : base.slice();
+    if (!state.woundIds.length) { state.currentIndex = -1; return; }
+    // 보고 있던 이미지가 새 필터에도 여전히 포함돼 있으면 그 자리를 유지하고,
+    // 필터에서 빠졌을 때만 0번으로 이동합니다.
+    const preservedIdx = currentId ? state.woundIds.indexOf(currentId) : -1;
+    state.currentIndex = preservedIdx >= 0 ? preservedIdx : 0;
+  }
+
   function loadImageFileList(files) {
     if (!files.length) {
       el.folderStatus.textContent = '이미지 파일을 찾지 못했습니다.';
@@ -998,7 +1014,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
     // 작업 목록의 유일한 기준은 이미지 파일명(확장자 제외)입니다.
     // 엑셀과 JSON은 이 목록을 만들거나 변경하지 않습니다.
-    state.woundIds = [];
+    const allIds = [];
     state.imagesByWound = {};
     const duplicateIds = [];
     let keptCount = 0;
@@ -1008,7 +1024,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         duplicateIds.push(imgId);
         return;
       }
-      state.woundIds.push(imgId);
+      allIds.push(imgId);
       state.imagesByWound[imgId] = [f];
       const existing = state.annotations[imgId];
       const hasExistingWork = existing && (
@@ -1022,9 +1038,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       };
     });
 
-    state.currentIndex = state.woundIds.length ? 0 : -1;
+    state.allWoundIds = allIds;
+    applyJsonMatchFilter();
     state.currentImageIndex = 0;
-    el.folderStatus.textContent = `${state.woundIds.length}개 이미지 불러옴` +
+    const filterNote = state.jsonLoadedIds.size ? ` · JSON 매칭된 ${state.woundIds.length}건만 작업 대상으로 표시 중` : '';
+    el.folderStatus.textContent = `${allIds.length}개 이미지 불러옴${filterNote}` +
       (keptCount ? ` · 기존 작업 ${keptCount}건 유지` : '') +
       (duplicateIds.length ? ` · 중복 파일명 ${duplicateIds.length}건 제외` : '');
     el.emptyState.style.display = state.woundIds.length ? 'none' : 'flex';
@@ -3741,6 +3759,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       }
     }
     persistAllAnnotations();
+    if (state.allWoundIds.length) applyJsonMatchFilter(); // 이미지가 먼저 로드되어 있었으면 즉시 목록 범위 재조정
     const statusEl2 = document.getElementById('jsonFolderStatus');
     if (statusEl2) statusEl2.textContent = `이미지 파일명 일치 ${matched}건` +
       (unmatched ? ` · 불일치 ${unmatched}건` : '') + (failed ? ` · 파싱 실패 ${failed}건` : '');
