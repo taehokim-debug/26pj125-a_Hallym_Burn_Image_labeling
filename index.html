@@ -3759,6 +3759,15 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     };
   }
 
+  // 1차 도구는 "통과(그대로 유지)"와 "제외"를 둘 다 status='annotated'로 내보내고,
+  // review_flag로만 제외 여부를 구분합니다. 2차 툴 기준 상태값으로 변환합니다.
+  // (rework_required/rework_complete 등 2차와 공유하는 값은 그대로 통과시킴)
+  function mapIncomingStatus(status, reviewFlag) {
+    if (reviewFlag === 'excluded') return 'excluded';
+    if (status === 'annotated') return 'review_complete';
+    return status;
+  }
+
   async function loadWorkJsonFileList(files) {
     const statusEl = document.getElementById('jsonFolderStatus');
     if (!files.length) { if (statusEl) statusEl.textContent = 'JSON 파일을 찾지 못했습니다.'; return false; }
@@ -3794,17 +3803,23 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         const candidateWoundId = resolvedWoundId || data.wound_id || prev.wound_id || '';
         const newFingerprint = computeFingerprint(data.rois);
         const isModified = !!prev._fingerprint && prev._fingerprint !== newFingerprint;
+        const mappedIncomingStatus = mapIncomingStatus(data.status, data.review_flag);
+        // 1차 작업자가 재작업을 반영해서 status='rework_complete'로 돌려보낸 경우엔
+        // 폴리곤이 바뀌는 게 정상/기대되는 일이므로, "수정본 감지로 인한 상태 리셋"에서
+        // 예외 처리합니다 (안 그러면 재작업 완료 신호가 매번 pending으로 사라짐).
+        const isReworkReturn = mappedIncomingStatus === 'rework_complete';
+        const shouldReset = isModified && !isReworkReturn;
         state.annotations[imgId] = Object.assign({}, prev, data, {
           id: imgId,
           image_id: imgId,
           wound_id: pickValidWoundId(candidateWoundId, imgId),
-          clinician_reviewed: isModified ? false : (prev.clinician_reviewed || data.clinician_reviewed || false),
-          status: isModified ? 'pending' : (prev.status || data.status || 'pending'),
-          review_flag: isModified ? null : (prev.review_flag != null ? prev.review_flag : (data.review_flag || null)),
-          exclusion_reason: isModified ? null : (prev.exclusion_reason || data.exclusion_reason || null),
-          rework_reason: isModified ? null : (prev.rework_reason || data.rework_reason || null),
-          review_comment: isModified ? null : (prev.review_comment || data.review_comment || null),
-          review_source: isModified ? null : (prev.review_source || data.review_source || null),
+          clinician_reviewed: shouldReset ? false : (prev.clinician_reviewed || data.clinician_reviewed || false),
+          status: shouldReset ? 'pending' : (isReworkReturn ? 'rework_complete' : (prev.status || mappedIncomingStatus || 'pending')),
+          review_flag: shouldReset ? null : (prev.review_flag != null ? prev.review_flag : (data.review_flag || null)),
+          exclusion_reason: shouldReset ? null : (prev.exclusion_reason || data.exclusion_reason || null),
+          rework_reason: shouldReset ? null : (prev.rework_reason || data.rework_reason || null),
+          review_comment: shouldReset ? null : (prev.review_comment || data.review_comment || null),
+          review_source: shouldReset ? null : (prev.review_source || data.review_source || null),
           _fingerprint: newFingerprint,
           _modified: isModified,
         });
