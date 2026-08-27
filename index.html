@@ -821,18 +821,29 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   }
   // 다운로드(백업) 시점의 ROI 지문을 기록해둡니다. 이후 이 지문이 그대로면
   // "백업 이후 수정 안 됨" = 안전하게 정리해도 되는 항목으로 판단합니다.
+  // 자동정리 안전성 판단용 서명: 폴리곤뿐 아니라 검수 상태/사유까지 전부 포함합니다.
+  // (폴리곤만 비교하면, JSON 불러온 뒤 검수통과만 누르고 아직 내보내지 않은 상태에서도
+  // "안 바뀐 것"으로 오인해 정리 대상이 되어버려서, 검수 결정이 사라질 위험이 있었습니다)
+  function computeBackupSignature(ann) {
+    return [
+      computeFingerprint(ann.rois || []),
+      ann.status || '', ann.review_flag || '', ann.exclusion_reason || '',
+      ann.rework_reason || '', ann.review_comment || '', ann.review_source || '',
+    ].join('::');
+  }
+
   function markBackedUp(entry) {
     const ann = state.annotations[entry.id];
     if (!ann) return;
-    ann._backedUpFingerprint = computeFingerprint(ann.rois || []);
+    ann._backedUpSignature = computeBackupSignature(ann);
     ann._backedUpAt = Date.now();
   }
 
-  // 저장 공간이 90% 넘으면, "이미 백업 완료 + 그 이후 수정 안 됨" 항목만
+  // 저장 공간이 90% 넘으면, "이미 백업 완료 + 그 이후 폴리곤·검수 상태 둘 다 안 바뀜" 항목만
   // 오래된 백업 순으로 골라 자동 정리합니다. 한 번도 백업 안 된 항목은 절대 건드리지 않습니다.
   function runSafeStorageCleanup() {
     const candidates = Object.entries(state.annotations)
-      .filter(([, ann]) => ann._backedUpFingerprint && ann._backedUpFingerprint === computeFingerprint(ann.rois || []))
+      .filter(([, ann]) => ann._backedUpSignature && ann._backedUpSignature === computeBackupSignature(ann))
       .sort((a, b) => (a[1]._backedUpAt || 0) - (b[1]._backedUpAt || 0));
     if (!candidates.length) return 0;
     let removed = 0;
@@ -3772,7 +3783,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const statusEl = document.getElementById('jsonFolderStatus');
     if (!files.length) { if (statusEl) statusEl.textContent = 'JSON 파일을 찾지 못했습니다.'; return false; }
 
-    const loadedImageIds = new Set(state.woundIds.map(normalizeMatchId));
+    // 필터링된 현재 화면 목록(state.woundIds)이 아니라 실제 로드된 전체 이미지 기준으로 매칭해야
+    // 이전 배치로 좁혀진 상태에서 새 배치를 불러와도 정상적으로 매칭됩니다.
+    const fullImageIds = state.allWoundIds.length ? state.allWoundIds : state.woundIds;
+    const loadedImageIds = new Set(fullImageIds.map(normalizeMatchId));
+    const newBatchIds = new Set(); // 이번에 불러온 배치의 이미지 id들
     let matched = 0, unmatched = 0, failed = 0;
     for (const f of files) {
       try {
@@ -3780,7 +3795,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         // JSON 내부 필드가 아니라 JSON 파일명을 최우선·유일 매칭 기준으로 사용합니다.
         const imgId = imageIdFromFilename(f.name);
         const normalizedId = normalizeMatchId(imgId);
-        if (state.woundIds.length && !loadedImageIds.has(normalizedId)) {
+        if (fullImageIds.length && !loadedImageIds.has(normalizedId)) {
           unmatched++;
           continue;
         }
@@ -3814,7 +3829,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           image_id: imgId,
           wound_id: pickValidWoundId(candidateWoundId, imgId),
           clinician_reviewed: shouldReset ? false : (prev.clinician_reviewed || data.clinician_reviewed || false),
-          status: shouldReset ? 'pending' : (isReworkReturn ? 'rework_complete' : (prev.status || mappedIncomingStatus || 'pending')),
+          status: shouldReset ? 'pending' : (isReworkReturn ? 'rework_complete' : ((prev.status && prev.status !== 'pending') ? prev.status : (mappedIncomingStatus || 'pending'))),
           review_flag: shouldReset ? null : (prev.review_flag != null ? prev.review_flag : (data.review_flag || null)),
           exclusion_reason: shouldReset ? null : (prev.exclusion_reason || data.exclusion_reason || null),
           rework_reason: shouldReset ? null : (prev.rework_reason || data.rework_reason || null),
@@ -3823,18 +3838,43 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           _fingerprint: newFingerprint,
           _modified: isModified,
         });
+        // 방금 불러온 파일 내용과 지금 상태가 일치하면(=수정된 게 아니면), 이 파일 자체가
+        // 이미 외부(1차/2차가 주고받은 원본 파일)에 존재하는 안전한 사본이므로 백업 완료로
+        // 간주합니다. 다운로드를 안 해도 "불러오기만 하고 손 안 댄 것"이 자동정리 대상이 됩니다.
+        // (폴리곤뿐 아니라 검수 상태까지 서명에 포함되므로, 이후 검수통과 등을 누르면
+        // 서명이 달라져서 다시 "아직 백업 안 된 것"으로 정확히 돌아갑니다)
+        if (!shouldReset) {
+          state.annotations[imgId]._backedUpSignature = computeBackupSignature(state.annotations[imgId]);
+          state.annotations[imgId]._backedUpAt = Date.now();
+        }
         matched++;
         state.jsonLoadedIds.add(imgId);
+        newBatchIds.add(imgId);
       } catch(err) {
         failed++;
         console.warn('JSON 로드 오류:', f.name, err.message);
       }
     }
+    // "새 배치를 불러오면 이전 배치는 정리한다" — 지금 보고 있던 배치(예: 1~100번)에서
+    // 새 배치(예: 101~200번)로 넘어가면, 겹치지 않는 이전 배치 데이터는 로컬에서 지웁니다.
+    // 같은 배치를 다시 불러온 경우(id가 그대로 겹침)는 아무것도 지워지지 않습니다.
+    let batchCleared = 0;
+    if (newBatchIds.size) {
+      const prevBatchIds = state.jsonLoadedIds;
+      for (const id of prevBatchIds) {
+        if (!newBatchIds.has(id)) {
+          delete state.annotations[id];
+          batchCleared++;
+        }
+      }
+      state.jsonLoadedIds = newBatchIds;
+    }
     persistAllAnnotations();
     if (state.allWoundIds.length) applyJsonMatchFilter(); // 이미지가 먼저 로드되어 있었으면 즉시 목록 범위 재조정
     const statusEl2 = document.getElementById('jsonFolderStatus');
     if (statusEl2) statusEl2.textContent = `이미지 파일명 일치 ${matched}건` +
-      (unmatched ? ` · 불일치 ${unmatched}건` : '') + (failed ? ` · 파싱 실패 ${failed}건` : '');
+      (unmatched ? ` · 불일치 ${unmatched}건` : '') + (failed ? ` · 파싱 실패 ${failed}건` : '') +
+      (batchCleared ? ` · 이전 배치 ${batchCleared}건 정리됨` : '');
     if (state.woundIds.length) {
       if (state.currentIndex < 0) state.currentIndex = 0;
       loadCurrentImageState();
