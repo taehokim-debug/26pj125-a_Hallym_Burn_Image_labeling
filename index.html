@@ -73,7 +73,7 @@ button{font-family:inherit;}
 
 /* LEFT */
 #leftPanel{width:auto;flex:none;display:flex;background:#fff;border-right:1px solid #e2e5e9;min-height:0;}
-#leftPanelSettings{width:150px;flex:none;overflow-y:auto;padding:16px 10px;border-right:1px solid #eef0f2;}
+#leftPanelSettings{width:150px;flex:none;min-width:110px;overflow-y:auto;padding:16px 10px;border-right:1px solid #eef0f2;}
 #leftPanelList{width:280px;flex:none;overflow:hidden;padding:16px 12px;display:flex;flex-direction:column;min-height:0;}
 #leftResizeHandle{width:6px;flex:none;cursor:col-resize;background:#eef0f2;position:relative;}
 #leftResizeHandle:hover,#leftResizeHandle.dragging{background:#d8dde3;}
@@ -605,7 +605,7 @@ button{font-family:inherit;}
   <div id="bottombar">
     <div style="display:flex;align-items:center;gap:8px;"><div id="autosaveDot"></div><div id="autosaveText">자동저장 켜짐</div></div>
     <div id="roiCountText">0 ROI</div>
-    <div id="storageUsage" style="font-size:11px;color:#9aa1aa;font-family:'JetBrains Mono',monospace;">LS 0KB / 5MB</div>
+    <div id="storageUsage" style="font-size:11px;color:#9aa1aa;font-family:'JetBrains Mono',monospace;">저장 대기 중</div>
     <button id="resetAllDataBtn" title="브라우저에 저장된 모든 작업 데이터를 삭제합니다">🗑 전체 데이터 초기화</button>
     <div id="sosWrap">
       <button id="reviewBtn" title="경계/깊이 불확실도가 높거나 재검토가 필요한 이미지로 표시합니다">🔍 검토 필요</button>
@@ -799,6 +799,53 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   /* ---------- localStorage ---------- */
   const LS_KEY = 'burnReview_annotations_v1';
 
+  // ===== IndexedDB 저장소 (localStorage 5MB 한도 문제 해결용) =====
+  // localStorage와 달리 용량 제한이 훨씬 넉넉해서(브라우저/디스크 여유에 따라 보통
+  // 수백MB~GB), 대용량 배치를 불러와도 자동으로 데이터가 삭제되는 문제가 없습니다.
+  const IDB_NAME = 'burnReviewDB';
+  const IDB_STORE = 'kv';
+  let _idbPromise = null;
+  function idbOpen() {
+    if (_idbPromise) return _idbPromise;
+    _idbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    return _idbPromise;
+  }
+  async function idbGet(key) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function idbSet(key, value) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+  async function idbRemove(key) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   // 검수자가 명시적으로 판단을 내린 상태 — 이후 폴리곤 편집(autosave)이 이 값을 되돌리면 안 됨
   const REVIEW_DECIDED_STATUSES = ['review_complete', 'clinician_review', 'clinician_complete', 'rework_required', 'excluded'];
   // 저장(자동저장/저장하고 다음) 시 뭉개지면 안 되는 상태 목록. rework_complete는 2차가
@@ -817,7 +864,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     allWoundIds: [],          // 이미지 폴더에서 매칭된 전체 이미지 id 목록 (JSON 필터와 무관하게 항상 보존)
     jsonLoadedIds: new Set(), // 지금 세션에서 JSON으로 실제 불러온 이미지 id 집합 (요검토 범위 + 작업 목록 필터 공용)
     currentImageIndex: 0,
-    annotations: loadAllAnnotations(), // wound_id -> { rois:[...], done:bool }
+    annotations: {}, // wound_id -> { rois:[...], done:bool } — IndexedDB에서 비동기로 채워짐 (아래 초기화 부분 참고)
     zoom: 1, panX: 0, panY: 0,
     mode: 'select',           // 'select' | 'draw' | 'multi' | 'simplify'
     rois: [],                 // 현재 wound의 ROI 배열
@@ -851,47 +898,65 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   let saveTimer = null;
   let pendingSave = false;
 
-  function loadAllAnnotations() {
-    try {
-      const raw = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
-      // 구버전 필드 마이그레이션
-      const REVIEW_STATUS_MAP = { confirmed: 'review_complete', flagged: 'clinician_review' };
-      const NEW_STATUSES = ['review_complete', 'clinician_review', 'clinician_complete', 'rework_required', 'excluded', 'pending'];
-      Object.values(raw).forEach((ann) => {
-        // done → status
-        if ('done' in ann && !('status' in ann)) {
-          ann.status = ann.done ? 'annotated' : 'not_started';
-          delete ann.done;
+  // 구버전 필드값들을 정리하는 순수 함수 (입출력 없음) — 어디서 불러온 데이터든 동일하게 적용
+  function migrateAnnotationsData(raw) {
+    const REVIEW_STATUS_MAP = { confirmed: 'review_complete', flagged: 'clinician_review' };
+    const NEW_STATUSES = ['review_complete', 'clinician_review', 'clinician_complete', 'rework_required', 'excluded', 'pending'];
+    Object.values(raw).forEach((ann) => {
+      // done → status
+      if ('done' in ann && !('status' in ann)) {
+        ann.status = ann.done ? 'annotated' : 'not_started';
+        delete ann.done;
+      }
+      // review_status(구버전) → status 단일화. 이미 신규 상태값이면 보호.
+      if ('review_status' in ann) {
+        if (!ann.status || !NEW_STATUSES.includes(ann.status)) {
+          ann.status = REVIEW_STATUS_MAP[ann.review_status] || ann.review_status || ann.status;
         }
-        // review_status(구버전) → status 단일화. 이미 신규 상태값이면 보호.
-        if ('review_status' in ann) {
-          if (!ann.status || !NEW_STATUSES.includes(ann.status)) {
-            ann.status = REVIEW_STATUS_MAP[ann.review_status] || ann.review_status || ann.status;
-          }
-          delete ann.review_status;
-        }
-        // review_flag: 'excluded' 인데 status가 아직 excluded로 반영 안된 구버전 데이터 보정
-        if (ann.review_flag === 'excluded' && ann.status !== 'excluded') {
-          ann.status = 'excluded';
-        }
-        if (!ann.status) ann.status = 'not_started';
-        if (!('review_flag' in ann)) ann.review_flag = null;
-        if (!('exclusion_reason' in ann)) ann.exclusion_reason = null;
-        if (!('image_meta' in ann)) ann.image_meta = null;
-        if (!('review_source' in ann)) ann.review_source = null;
-        if (!('rework_reason' in ann)) ann.rework_reason = null;
-        if (!('review_comment' in ann)) ann.review_comment = null;
-        // ROI unc 마이그레이션
-        (ann.rois || []).forEach(migrateRoiUnc);
-      });
-      return raw;
-    } catch (e) { return {}; }
+        delete ann.review_status;
+      }
+      // review_flag: 'excluded' 인데 status가 아직 excluded로 반영 안된 구버전 데이터 보정
+      if (ann.review_flag === 'excluded' && ann.status !== 'excluded') {
+        ann.status = 'excluded';
+      }
+      if (!ann.status) ann.status = 'not_started';
+      if (!('review_flag' in ann)) ann.review_flag = null;
+      if (!('exclusion_reason' in ann)) ann.exclusion_reason = null;
+      if (!('image_meta' in ann)) ann.image_meta = null;
+      if (!('review_source' in ann)) ann.review_source = null;
+      if (!('rework_reason' in ann)) ann.rework_reason = null;
+      if (!('review_comment' in ann)) ann.review_comment = null;
+      // ROI unc 마이그레이션
+      (ann.rois || []).forEach(migrateRoiUnc);
+    });
+    return raw;
   }
-  // 다운로드(백업) 시점의 ROI 지문을 기록해둡니다. 이후 이 지문이 그대로면
-  // "백업 이후 수정 안 됨" = 안전하게 정리해도 되는 항목으로 판단합니다.
-  // 자동정리 안전성 판단용 서명: 폴리곤뿐 아니라 검수 상태/사유까지 전부 포함합니다.
-  // (폴리곤만 비교하면, JSON 불러온 뒤 검수통과만 누르고 아직 내보내지 않은 상태에서도
-  // "안 바뀐 것"으로 오인해 정리 대상이 되어버려서, 검수 결정이 사라질 위험이 있었습니다)
+
+  // IndexedDB에서 불러오되, 아직 IndexedDB에 아무것도 없고 예전 localStorage에
+  // 데이터가 남아있으면(버전업 이전 사용자) 그 데이터를 그대로 IndexedDB로 옮겨줍니다.
+  // 이후로는 계속 IndexedDB만 씁니다 — localStorage는 다시 안 건드립니다.
+  async function loadAllAnnotationsAsync() {
+    let raw = null;
+    try {
+      const fromIdb = await idbGet(LS_KEY);
+      if (fromIdb) raw = JSON.parse(fromIdb);
+    } catch (e) { /* IndexedDB 읽기 실패 시 아래에서 빈 값으로 진행 */ }
+
+    if (!raw) {
+      // IndexedDB에 아직 없으면, 예전 localStorage 데이터가 있는지 확인해서 한 번만 옮겨옵니다.
+      try {
+        const legacy = localStorage.getItem(LS_KEY);
+        if (legacy) {
+          raw = JSON.parse(legacy);
+          await idbSet(LS_KEY, legacy); // 그대로 IndexedDB에 이관 (필드 마이그레이션은 아래서 공통 적용)
+        }
+      } catch (e) { /* 무시하고 빈 값으로 진행 */ }
+    }
+    if (!raw) raw = {};
+    return migrateAnnotationsData(raw);
+  }
+  // 다운로드(백업) 시점의 서명을 기록해둡니다. IndexedDB로 전환하면서 자동 삭제 기능은
+  // 없앴지만, 어떤 항목을 이미 내보냈는지 참고 정보로 남겨두는 용도로는 계속 씁니다.
   function computeBackupSignature(ann) {
     return [
       computeFingerprint(ann.rois || []),
@@ -907,66 +972,24 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     ann._backedUpAt = Date.now();
   }
 
-  // 저장 공간이 90% 넘으면, "이미 백업 완료 + 그 이후 폴리곤·검수 상태 둘 다 안 바뀜" 항목만
-  // 오래된 백업 순으로 골라 자동 정리합니다. 한 번도 백업 안 된 항목은 절대 건드리지 않습니다.
-  function runSafeStorageCleanup() {
-    const candidates = Object.entries(state.annotations)
-      .filter(([, ann]) => ann._backedUpSignature && ann._backedUpSignature === computeBackupSignature(ann))
-      .sort((a, b) => (a[1]._backedUpAt || 0) - (b[1]._backedUpAt || 0));
-    if (!candidates.length) return 0;
-    let removed = 0;
-    for (const [id] of candidates) {
-      delete state.annotations[id];
-      removed++;
-      const usagePct = (JSON.stringify(state.annotations).length / (5 * 1024 * 1024)) * 100;
-      if (usagePct < 70) break; // 여유 있게 70%까지만 정리하고 멈춤
-    }
-    if (removed > 0) {
-      try {
-        const serialized = JSON.stringify(state.annotations);
-        localStorage.setItem(LS_KEY, serialized);
-        const storageEl = document.getElementById('storageUsage');
-        if (storageEl) {
-          const usageKB = serialized.length / 1024;
-          const usagePct = (serialized.length / (5 * 1024 * 1024)) * 100;
-          storageEl.textContent = `LS ${usageKB.toFixed(0)}KB / 5MB (자동정리 ${removed}건)`;
-          storageEl.style.color = usagePct > 80 ? '#c0504f' : usagePct > 50 ? '#b9821b' : '#9aa1aa';
-        }
-        renderImageList();
-        renderWorkPanel();
-      } catch (e) { /* 정리 후 재저장 실패는 무시 (다음 저장 때 재시도됨) */ }
-    }
-    return removed;
-  }
-
-  function persistAllAnnotations(skipCleanupCheck) {
+  // IndexedDB는 localStorage(5MB)보다 훨씬 여유로운 용량을 쓰기 때문에, 용량을 이유로
+  // 저장된 데이터를 자동으로 지우는 로직은 더 이상 사용하지 않습니다 — 대용량 배치를
+  // 불러와도 예고 없이 데이터가 삭제되는 일이 없습니다.
+  async function persistAllAnnotations() {
     try {
       const serialized = JSON.stringify(state.annotations);
-      localStorage.setItem(LS_KEY, serialized);
-      // 용량 경고: 5MB 한도 기준
-      const usageKB = serialized.length / 1024;
-      const usagePct = (serialized.length / (5 * 1024 * 1024)) * 100;
+      await idbSet(LS_KEY, serialized);
+      const usageMB = serialized.length / (1024 * 1024);
       const storageEl = document.getElementById('storageUsage');
       if (storageEl) {
-        storageEl.textContent = `LS ${usageKB.toFixed(0)}KB / 5MB`;
-        storageEl.style.color = usagePct > 80 ? '#c0504f' : usagePct > 50 ? '#b9821b' : '#9aa1aa';
-      }
-      if (!skipCleanupCheck && usagePct >= 90) {
-        runSafeStorageCleanup();
+        storageEl.textContent = `저장됨 · ${usageMB.toFixed(1)}MB`;
+        storageEl.style.color = '#9aa1aa';
       }
     } catch (e) {
-      // QuotaExceededError: localStorage 한도 초과
-      // 저장이 이미 실패한 위급 상황이므로, 먼저 안전 정리를 시도해서 공간을 확보합니다.
-      const removed = skipCleanupCheck ? 0 : runSafeStorageCleanup();
-      if (removed > 0) {
-        try { localStorage.setItem(LS_KEY, JSON.stringify(state.annotations)); return; } catch (e2) { /* 그래도 실패하면 아래 경고로 진행 */ }
-      }
-      const msg = removed > 0
-        ? `localStorage 저장 한도(5MB)를 초과했습니다.\n이미 백업된 ${removed}건을 자동 정리했지만 여전히 공간이 부족합니다.\n지금 즉시 ⤓ JSON 버튼으로 작업 내용을 백업하세요.`
-        : 'localStorage 저장 한도(5MB)를 초과했습니다.\n지금 즉시 ⤓ JSON 버튼으로 작업 내용을 백업하세요.\n\n(백업 후 오래된 항목을 삭제하거나, 새 파일로 이어서 작업하세요.)';
-      alert(msg);
-      // 저장 상태 표시 업데이트
-      el.saveStatusText.textContent = '저장 실패 — 한도 초과!';
+      // IndexedDB는 용량이 넉넉해서 거의 발생하지 않지만, 혹시 실패하면 알려줍니다.
+      alert('저장에 실패했습니다.\n' + (e && e.message ? e.message : '') +
+        '\n지금 즉시 ⤓ JSON 버튼으로 작업 내용을 백업해 주세요.');
+      el.saveStatusText.textContent = '저장 실패!';
       el.saveDot.style.background = '#c0504f';
     }
   }
@@ -3250,7 +3273,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     }
     downloadText(entry.id + '.json', JSON.stringify(entry, null, 1), 'application/json');
     markBackedUp(entry);
-    persistAllAnnotations(true);
+    persistAllAnnotations();
   };
   el.exportZipBtn.onclick = async () => {
     flushPendingSave();
@@ -3270,7 +3293,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
     downloadBlob('review_' + new Date().toISOString().slice(0,10) + '.zip', blob);
     reviewed.forEach(markBackedUp);
-    persistAllAnnotations(true);
+    persistAllAnnotations();
     const bodyMsg = skipped.length > 0
       ? '✅ 저장됨: ' + reviewed.length + '건\n⏭ 미검수 제외: ' + skipped.length + '건\n\n미검수 항목은 ZIP에 포함되지 않았습니다.'
       : '✅ 전체 ' + reviewed.length + '건 모두 저장됨.';
@@ -3303,7 +3326,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     if (el.downloadCompleteOverlay) el.downloadCompleteOverlay.classList.remove('show');
   };
 
-  if (el.resetAllDataBtn) el.resetAllDataBtn.onclick = () => {
+  if (el.resetAllDataBtn) el.resetAllDataBtn.onclick = async () => {
     const ok = confirm(
       '브라우저에 저장된 모든 작업 데이터를 삭제합니다.\n' +
       '아직 다운로드하지 않은 검수 내용은 복구할 수 없습니다.\n\n' +
@@ -3311,7 +3334,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       '정말로 전체 초기화하시겠습니까?'
     );
     if (!ok) return;
-    try { localStorage.removeItem(LS_KEY); } catch (e) {}
+    try { await idbRemove(LS_KEY); } catch (e) {}
+    try { localStorage.removeItem(LS_KEY); } catch (e) {} // 혹시 남아있는 예전 데이터도 같이 정리
     location.reload();
   };
 
@@ -4198,12 +4222,19 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     }
   };
 
-  el.imageInfoCard.innerHTML = `<div class="cardRow"><span class="k">상태</span><span class="v">대기 중</span></div>`;
-  el.metaCard.innerHTML = `<div class="cardRow"><span class="k">상태</span><span class="v">대기 중</span></div>`;
-  renderReviewPanel(); // localStorage에 저장된 review_flag 즉시 반영
-  renderSosPanel();
-  updateProgress();
-  renderAll();
+  el.imageInfoCard.innerHTML = `<div class="cardRow"><span class="k">상태</span><span class="v">불러오는 중…</span></div>`;
+  el.metaCard.innerHTML = `<div class="cardRow"><span class="k">상태</span><span class="v">불러오는 중…</span></div>`;
+  // IndexedDB에서 저장된 작업 데이터를 비동기로 불러온 뒤 화면을 그립니다.
+  // (보통 수십 ms 이내로 끝나서 체감상 거의 즉시 뜨는 것과 차이가 없습니다)
+  (async function initFromIndexedDB() {
+    state.annotations = await loadAllAnnotationsAsync();
+    el.imageInfoCard.innerHTML = `<div class="cardRow"><span class="k">상태</span><span class="v">대기 중</span></div>`;
+    el.metaCard.innerHTML = `<div class="cardRow"><span class="k">상태</span><span class="v">대기 중</span></div>`;
+    renderReviewPanel(); // 저장된 review_flag 즉시 반영
+    renderSosPanel();
+    updateProgress();
+    renderAll();
+  })();
 
   // 2차 검수 / 의료진 검토 모드 전환 — 버튼 구성은 동일하되 저장되는 상태값이 달라짐
   function applyUserMode() {
@@ -4221,34 +4252,51 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   });
   applyUserMode();
 
-  // 이미지 목록 폭 드래그 조절 (200~420px), 마지막 값은 localStorage에 기억
+  // 정보(왼쪽) / 목록(오른쪽) 사이 경계선 드래그 — 하나를 늘리면 다른 하나가 그만큼 줄어듭니다.
+  // 각자 마지막 폭을 localStorage에 따로 기억합니다.
   (function() {
     const handle = document.getElementById('leftResizeHandle');
+    const settingsCol = document.getElementById('leftPanelSettings');
     const listCol = document.getElementById('leftPanelList');
-    if (!handle || !listCol) return;
+    if (!handle || !settingsCol || !listCol) return;
+    const SETTINGS_WIDTH_KEY = 'burnReview_settingsColWidth';
     const LIST_WIDTH_KEY = 'burnReview_listColWidth';
-    const saved = parseInt(localStorage.getItem(LIST_WIDTH_KEY), 10);
-    if (saved && saved >= 200 && saved <= 420) listCol.style.width = saved + 'px';
+    const MIN_SETTINGS = 110, MAX_SETTINGS = 320;
+    const MIN_LIST = 200, MAX_LIST = 420;
 
-    let dragging = false, startX = 0, startW = 0;
+    const savedSettings = parseInt(localStorage.getItem(SETTINGS_WIDTH_KEY), 10);
+    if (savedSettings && savedSettings >= MIN_SETTINGS && savedSettings <= MAX_SETTINGS) settingsCol.style.width = savedSettings + 'px';
+    const savedList = parseInt(localStorage.getItem(LIST_WIDTH_KEY), 10);
+    if (savedList && savedList >= MIN_LIST && savedList <= MAX_LIST) listCol.style.width = savedList + 'px';
+
+    let dragging = false, startX = 0, startSettingsW = 0, startListW = 0;
     handle.addEventListener('pointerdown', (e) => {
       dragging = true;
       startX = e.clientX;
-      startW = listCol.getBoundingClientRect().width;
+      startSettingsW = settingsCol.getBoundingClientRect().width;
+      startListW = listCol.getBoundingClientRect().width;
       handle.classList.add('dragging');
       handle.setPointerCapture(e.pointerId);
     });
     handle.addEventListener('pointermove', (e) => {
       if (!dragging) return;
-      let newW = startW + (e.clientX - startX);
-      newW = Math.max(200, Math.min(420, newW));
-      listCol.style.width = newW + 'px';
+      let dx = e.clientX - startX;
+      // 두 컬럼 다 각자의 최소/최대 범위 안에 있도록 dx 자체를 제한
+      dx = Math.max(MIN_SETTINGS - startSettingsW, dx);
+      dx = Math.min(MAX_SETTINGS - startSettingsW, dx);
+      dx = Math.max(startListW - MAX_LIST, dx);
+      dx = Math.min(startListW - MIN_LIST, dx);
+      settingsCol.style.width = (startSettingsW + dx) + 'px';
+      listCol.style.width = (startListW - dx) + 'px';
     });
     function endDrag() {
       if (!dragging) return;
       dragging = false;
       handle.classList.remove('dragging');
-      try { localStorage.setItem(LIST_WIDTH_KEY, Math.round(listCol.getBoundingClientRect().width)); } catch (e) {}
+      try {
+        localStorage.setItem(SETTINGS_WIDTH_KEY, Math.round(settingsCol.getBoundingClientRect().width));
+        localStorage.setItem(LIST_WIDTH_KEY, Math.round(listCol.getBoundingClientRect().width));
+      } catch (e) {}
     }
     handle.addEventListener('pointerup', endDrag);
     handle.addEventListener('pointercancel', endDrag);
