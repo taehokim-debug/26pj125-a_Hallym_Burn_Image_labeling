@@ -27,6 +27,16 @@ body.mode-clinician .userModeBtn.on{background:#0f766e;color:#fff;}
 html,body{height:100%;}
 body{font-family:-apple-system,BlinkMacSystemFont,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;color:#22262c;overflow:hidden;}
 #depthWarnPopup{position:absolute;top:14px;right:14px;z-index:9;display:none;flex-direction:column;gap:7px;background:rgba(28,31,35,0.96);border:1px solid rgba(255,107,107,0.45);border-radius:11px;padding:12px 14px;box-shadow:0 8px 26px rgba(0,0,0,0.38);width:240px;}
+#feedbackBanner{position:absolute;top:14px;left:14px;z-index:9;display:none;flex-direction:column;gap:7px;background:rgba(28,31,35,0.96);border:1px solid rgba(79,70,229,0.45);border-radius:11px;padding:12px 14px;box-shadow:0 8px 26px rgba(0,0,0,0.38);width:280px;max-height:60vh;overflow-y:auto;}
+#feedbackBanner.show{display:flex;}
+#feedbackBanner .fbHead{display:flex;align-items:center;gap:7px;}
+#feedbackBanner .fbIcon{font-size:14px;}
+#feedbackBanner .fbTitle{flex:1;font-size:12.5px;font-weight:700;color:#f2f3f5;}
+#feedbackBannerCloseBtn{background:none;border:none;color:#9aa1aa;font-size:16px;cursor:pointer;line-height:1;padding:0 2px;}
+#feedbackBanner .fbBody{font-size:12px;color:#d7dade;line-height:1.6;}
+#feedbackBanner .fbItem{margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid rgba(255,255,255,0.08);}
+#feedbackBanner .fbItem:last-child{margin-bottom:0;padding-bottom:0;border-bottom:none;}
+#feedbackBanner .fbItemLabel{font-weight:700;color:#a5b4fc;margin-bottom:2px;}
 #downloadCompleteOverlay{position:fixed;inset:0;z-index:50;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,0.45);}
 #downloadCompleteOverlay.show{display:flex;}
 #downloadCompleteBox{background:#fff;border-radius:14px;padding:22px 24px;width:340px;box-shadow:0 20px 60px rgba(0,0,0,0.35);}
@@ -39,6 +49,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Apple SD Gothic Neo','Malgun 
 #copyStatusListNote{font-size:11.5px;color:#2f8a56;margin-top:8px;min-height:14px;}
 #resetAllDataBtn{height:26px;padding:0 10px;border:1px solid rgba(192,80,79,0.35);border-radius:6px;background:#fbeded;color:#c0504f;font-size:11px;cursor:pointer;}
 #resetAllDataBtn:hover{background:#f6dede;}
+.reworkReasonFlash{animation:reworkReasonFlash 1.2s ease;}
+@keyframes reworkReasonFlash{0%,100%{box-shadow:none;}20%,60%{box-shadow:0 0 0 3px rgba(147,51,234,0.55);}40%,80%{box-shadow:none;}}
 #depthWarnPopup .dwHead{display:flex;align-items:center;gap:7px;}
 #depthWarnPopup .dwIcon{color:#ff6b6b;font-size:14px;}
 #depthWarnPopup .dwTitle{flex:1;font-size:12.5px;font-weight:700;color:#f2f3f5;}
@@ -404,6 +416,14 @@ button{font-family:inherit;}
           <button id="depthWarnCloseBtn" title="닫기">×</button>
         </div>
         <div class="dwBody" id="depthWarnBody"></div>
+      </div>
+      <div id="feedbackBanner">
+        <div class="fbHead">
+          <span class="fbIcon">💬</span>
+          <span class="fbTitle">남겨진 피드백</span>
+          <button id="feedbackBannerCloseBtn" title="닫기">×</button>
+        </div>
+        <div class="fbBody" id="feedbackBannerBody"></div>
       </div>
       <div class="floatToolbar">
         <button class="toolBtn" id="zoomOutBtn" title="축소">−</button>
@@ -846,6 +866,64 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     });
   }
 
+  // ===== 이미지 단위 저장 =====
+  // 예전엔 state.annotations 전체(300~1000건)를 한 키(LS_KEY)에 통째로 저장했는데,
+  // 이러면 이미지 1건만 수정해도 매번 전체를 다시 직렬화+저장해야 해서, 데이터가
+  // 커질수록(ROI/점이 많을수록) 저장 1회 비용이 전체 배치 크기에 비례해 커지는
+  // 문제가 있었습니다(43.8MB 데이터 기준 저장 1회 약 628ms, 1000회면 10분 이상).
+  // 이미지별로 별도 키("annotation:이미지id")에 저장해서, 1건 수정 시 그 1건만
+  // 직렬화+저장하도록 바꿉니다.
+  const ANN_KEY_PREFIX = 'annotation:';
+  function idbGetAnnotation(imageId) { return idbGet(ANN_KEY_PREFIX + imageId); }
+  function idbSetAnnotationRaw(imageId, serializedStr) { return idbSet(ANN_KEY_PREFIX + imageId, serializedStr); }
+  function idbRemoveAnnotation(imageId) { return idbRemove(ANN_KEY_PREFIX + imageId); }
+
+  // 여러 건을 한 번에 읽을 때(배치 불러오기 등) 하나의 트랜잭션으로 처리합니다.
+  async function idbGetAnnotationsBulk(imageIds) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const result = {};
+      let pending = imageIds.length;
+      if (!pending) { resolve(result); return; }
+      imageIds.forEach((id) => {
+        const req = store.get(ANN_KEY_PREFIX + id);
+        req.onsuccess = () => { if (req.result != null) result[id] = req.result; if (--pending === 0) resolve(result); };
+        req.onerror = () => { if (--pending === 0) resolve(result); };
+      });
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  // "전체 데이터 초기화"용 — 이미지별로 저장된 "annotation:" 키를 전부 지웁니다.
+  async function idbClearAllAnnotations() {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.getAllKeys();
+      req.onsuccess = () => {
+        (req.result || []).forEach((k) => {
+          if (typeof k === 'string' && k.indexOf(ANN_KEY_PREFIX) === 0) store.delete(k);
+        });
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  // 저장된 "annotation:" 키가 하나라도 있는지(=이미 새 방식으로 전환됐는지) 확인용.
+  async function idbHasAnyAnnotationKey() {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).getAllKeys();
+      req.onsuccess = () => resolve((req.result || []).some((k) => typeof k === 'string' && k.indexOf(ANN_KEY_PREFIX) === 0));
+      req.onerror = () => reject(req.error);
+    });
+  }
+
   // 검수자가 명시적으로 판단을 내린 상태 — 이후 폴리곤 편집(autosave)이 이 값을 되돌리면 안 됨
   const REVIEW_DECIDED_STATUSES = ['review_complete', 'clinician_review', 'clinician_complete', 'rework_required', 'excluded'];
   // 저장(자동저장/저장하고 다음) 시 뭉개지면 안 되는 상태 목록. rework_complete는 2차가
@@ -857,12 +935,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   const state = {
     userMode: (localStorage.getItem('burnReview_userMode') === 'clinician') ? 'clinician' : 'reviewer',
     depthWarnDismissedId: null,
+    feedbackBannerDismissedId: null,
     woundIds: [],            // 이미지가 매칭된 wound_id 목록 (정렬됨)
     currentIndex: -1,
     imagesByWound: {},        // wound_id -> [File, ...]
     rawImageFiles: [],        // 폴더 선택 시 원본 File 목록 (엑셀 재로드 시 재매칭용)
     allWoundIds: [],          // 이미지 폴더에서 매칭된 전체 이미지 id 목록 (JSON 필터와 무관하게 항상 보존)
     jsonLoadedIds: new Set(), // 지금 세션에서 JSON으로 실제 불러온 이미지 id 집합 (요검토 범위 + 작업 목록 필터 공용)
+    imageLoadedIds: null, // 가장 최근 이미지 폴더 불러오기로 구성된 배치의 id 집합 (RAM 정리용)
     currentImageIndex: 0,
     annotations: {}, // wound_id -> { rois:[...], done:bool } — IndexedDB에서 비동기로 채워짐 (아래 초기화 부분 참고)
     zoom: 1, panX: 0, panY: 0,
@@ -932,28 +1012,41 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return raw;
   }
 
-  // IndexedDB에서 불러오되, 아직 IndexedDB에 아무것도 없고 예전 localStorage에
-  // 데이터가 남아있으면(버전업 이전 사용자) 그 데이터를 그대로 IndexedDB로 옮겨줍니다.
-  // 이후로는 계속 IndexedDB만 씁니다 — localStorage는 다시 안 건드립니다.
-  async function loadAllAnnotationsAsync() {
+  // 예전 버전은 시작할 때 전체 annotations(300~1000건 전부)를 한꺼번에 state.annotations에
+  // 올려놨는데, 지금은 "지금 작업 중인 배치에 필요한 것만" 이미지 폴더를 불러오는 시점에
+  // 가져오는 방식으로 바뀌었습니다. 그래서 시작할 때는 RAM에 아무것도 안 올리고, 대신
+  // "예전 방식(LS_KEY 하나에 전체를 통째로 저장)으로 남아있는 데이터가 있으면, 새 방식
+  // (이미지별 개별 키)으로 한 번만 옮겨두는" 마이그레이션만 수행합니다.
+  async function migrateLegacyAnnotationsIfNeeded() {
+    try {
+      const hasNew = await idbHasAnyAnnotationKey();
+      if (hasNew) return; // 이미 새 방식으로 전환된 상태 — 마이그레이션 불필요
+    } catch (e) { return; }
+
     let raw = null;
     try {
       const fromIdb = await idbGet(LS_KEY);
       if (fromIdb) raw = JSON.parse(fromIdb);
-    } catch (e) { /* IndexedDB 읽기 실패 시 아래에서 빈 값으로 진행 */ }
-
+    } catch (e) { /* 무시 */ }
     if (!raw) {
-      // IndexedDB에 아직 없으면, 예전 localStorage 데이터가 있는지 확인해서 한 번만 옮겨옵니다.
       try {
         const legacy = localStorage.getItem(LS_KEY);
-        if (legacy) {
-          raw = JSON.parse(legacy);
-          await idbSet(LS_KEY, legacy); // 그대로 IndexedDB에 이관 (필드 마이그레이션은 아래서 공통 적용)
-        }
-      } catch (e) { /* 무시하고 빈 값으로 진행 */ }
+        if (legacy) raw = JSON.parse(legacy);
+      } catch (e) { /* 무시 */ }
     }
-    if (!raw) raw = {};
-    return migrateAnnotationsData(raw);
+    if (!raw) return; // 옮길 예전 데이터 자체가 없음 — 완전히 새 사용자
+
+    raw = migrateAnnotationsData(raw);
+    // 이미지별 키로 하나씩 옮겨 씁니다. 실패해도 예전 LS_KEY 데이터는 그대로 두기 때문에
+    // (아래에서 지우지 않음) 다음에 페이지를 열 때 다시 시도할 수 있어 안전합니다.
+    try {
+      const ids = Object.keys(raw);
+      for (const id of ids) {
+        await idbSetAnnotationRaw(id, JSON.stringify(raw[id]));
+      }
+    } catch (e) {
+      console.warn('예전 데이터 이관 중 일부 실패 — 예전 데이터는 그대로 보존됩니다:', e);
+    }
   }
   // 다운로드(백업) 시점의 서명을 기록해둡니다. IndexedDB로 전환하면서 자동 삭제 기능은
   // 없앴지만, 어떤 항목을 이미 내보냈는지 참고 정보로 남겨두는 용도로는 계속 씁니다.
@@ -975,22 +1068,78 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   // IndexedDB는 localStorage(5MB)보다 훨씬 여유로운 용량을 쓰기 때문에, 용량을 이유로
   // 저장된 데이터를 자동으로 지우는 로직은 더 이상 사용하지 않습니다 — 대용량 배치를
   // 불러와도 예고 없이 데이터가 삭제되는 일이 없습니다.
-  async function persistAllAnnotations() {
+
+  // 텍스트 입력처럼 짧은 시간에 반복 발생하는 이벤트는, 입력이 잠깐 멈췄을 때
+  // 한 번만 저장하도록 모아서 처리합니다 (매 keystroke마다 전체 저장하는 걸 방지).
+  // 다운로드·이미지 이동 등 "지금 당장 최신 상태가 필요한" 동작 직전에는
+  // flushPendingCommentSave()로 대기 중인 저장을 즉시 실행할 수 있습니다.
+  let _commentSaveTimer = null;
+  let _pendingCommentSaveFn = null;
+  function scheduleCommentSave(saveFn, delayMs) {
+    clearTimeout(_commentSaveTimer);
+    _pendingCommentSaveFn = saveFn;
+    _commentSaveTimer = setTimeout(() => {
+      _pendingCommentSaveFn = null;
+      saveFn();
+    }, delayMs || 400);
+  }
+  function flushPendingCommentSave() {
+    if (!_pendingCommentSaveFn) return;
+    clearTimeout(_commentSaveTimer);
+    const fn = _pendingCommentSaveFn;
+    _pendingCommentSaveFn = null;
+    fn();
+  }
+
+  // 저장은 "이미지를 넘길 때마다" 매우 자주 호출됩니다. 예전엔 매번 state.annotations
+  // 전체(300~1000건)를 통째로 직렬화+저장해서, 데이터가 커질수록(ROI/점이 많을수록)
+  // 저장 1회 비용이 전체 배치 크기에 비례해 커지는 문제가 있었습니다(약 44MB 데이터
+  // 기준 1회 약 628ms — 1000회면 10분 이상 누적). 이제 이미지별로 "그 이미지 1건만"
+  // 직렬화+저장합니다. 겹침 방지 원리는 그대로 유지하되, 전체 단위(boolean)가 아니라
+  // "저장이 필요한 이미지id 집합(Set)" 단위로 관리합니다 — 짧은 시간에 같은 이미지가
+  // 여러 번 큐에 들어와도 중복 저장되지 않고, 쓰기는 항상 1건씩만 동시에 진행됩니다.
+  const _dirtyAnnotationIds = new Set();
+  let _annotationFlushRunning = false;
+  function persistAnnotation(imageId) {
+    if (!imageId) return;
+    _dirtyAnnotationIds.add(imageId);
+    if (!_annotationFlushRunning) flushAnnotationQueue();
+  }
+  async function flushAnnotationQueue() {
+    if (_annotationFlushRunning) return;
+    _annotationFlushRunning = true;
     try {
-      const serialized = JSON.stringify(state.annotations);
-      await idbSet(LS_KEY, serialized);
-      const usageMB = serialized.length / (1024 * 1024);
+      while (_dirtyAnnotationIds.size) {
+        const ids = Array.from(_dirtyAnnotationIds);
+        _dirtyAnnotationIds.clear();
+        for (const imageId of ids) {
+          const ann = state.annotations[imageId];
+          if (!ann) continue; // 저장 대기 중 삭제된 경우(배치 정리 등) 건너뜀
+          try {
+            await idbSetAnnotationRaw(imageId, JSON.stringify(ann));
+          } catch (e) {
+            // IndexedDB는 용량이 넉넉해서 거의 발생하지 않지만, 혹시 실패하면 알려줍니다.
+            alert('저장에 실패했습니다.\n' + (e && e.message ? e.message : '') +
+              '\n지금 즉시 ⤓ JSON 버튼으로 작업 내용을 백업해 주세요.');
+            el.saveStatusText.textContent = '저장 실패!';
+            el.saveDot.style.background = '#c0504f';
+          }
+        }
+      }
       const storageEl = document.getElementById('storageUsage');
       if (storageEl) {
-        storageEl.textContent = `저장됨 · ${usageMB.toFixed(1)}MB`;
+        storageEl.textContent = `저장됨 · ${Object.keys(state.annotations).length}건 추적 중`;
         storageEl.style.color = '#9aa1aa';
       }
-    } catch (e) {
-      // IndexedDB는 용량이 넉넉해서 거의 발생하지 않지만, 혹시 실패하면 알려줍니다.
-      alert('저장에 실패했습니다.\n' + (e && e.message ? e.message : '') +
-        '\n지금 즉시 ⤓ JSON 버튼으로 작업 내용을 백업해 주세요.');
-      el.saveStatusText.textContent = '저장 실패!';
-      el.saveDot.style.background = '#c0504f';
+    } finally {
+      _annotationFlushRunning = false;
+    }
+  }
+  // 저장이 전부 끝날 때까지 기다려야 하는 지점(새 배치 로드 직전 등)에서 사용합니다.
+  async function flushAnnotationQueueAndWait() {
+    while (_annotationFlushRunning || _dirtyAnnotationIds.size) {
+      if (!_annotationFlushRunning) flushAnnotationQueue();
+      await new Promise((r) => setTimeout(r, 20));
     }
   }
 
@@ -1028,6 +1177,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     readoutName: $('readoutName'), readoutDims: $('readoutDims'),
     roiCountTop: $('roiCountTop'), roiListBody: $('roiListBody'), addRoiBtn: $('addRoiBtn'),
     depthWarnBadge: $('depthWarnBadge'), depthWarnPopup: $('depthWarnPopup'), depthWarnBody: $('depthWarnBody'), depthWarnCloseBtn: $('depthWarnCloseBtn'),
+    feedbackBanner: $('feedbackBanner'), feedbackBannerBody: $('feedbackBannerBody'), feedbackBannerCloseBtn: $('feedbackBannerCloseBtn'),
     propsEmpty: $('propsEmpty'), propsBody: $('propsBody'),
     nameInput: $('nameInput'), nameSwatch: $('nameSwatch'),
     typeRow: $('typeRow'), parentBlock: $('parentBlock'), parentSelect: $('parentSelect'),
@@ -1140,11 +1290,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return true;
   }
 
-  el.folderInput.onchange = (e) => {
+  el.folderInput.onchange = async (e) => {
     const files = Array.from(e.target.files || [])
       .filter(f => /\.(jpg|jpeg|png|webp)$/i.test(f.name))
       .sort((a, b) => a.name.localeCompare(b.name, 'ko'));
-    loadImageFileList(files);
+    await loadImageFileList(files);
     e.target.value = '';
   };
 
@@ -1163,18 +1313,21 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     state.currentIndex = preservedIdx >= 0 ? preservedIdx : 0;
   }
 
-  function loadImageFileList(files) {
+  async function loadImageFileList(files) {
     if (!files.length) {
       el.folderStatus.textContent = '이미지 파일을 찾지 못했습니다.';
       return false;
     }
+
+    // 새 배치를 불러오기 전, 지금까지의 수정이 전부 IndexedDB에 반영되도록 먼저 흘려보냅니다.
+    // (바로 이어서 이전 배치 RAM을 정리하므로, 그 전에 저장이 끝나 있어야 유실이 없습니다)
+    await flushAnnotationQueueAndWait();
 
     // 작업 목록의 유일한 기준은 이미지 파일명(확장자 제외)입니다.
     // 엑셀과 JSON은 이 목록을 만들거나 변경하지 않습니다.
     const allIds = [];
     state.imagesByWound = {};
     const duplicateIds = [];
-    let keptCount = 0;
     files.forEach((f) => {
       const imgId = imageIdFromFilename(f.name);
       if (state.imagesByWound[imgId]) {
@@ -1183,7 +1336,34 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       }
       allIds.push(imgId);
       state.imagesByWound[imgId] = [f];
-      const existing = state.annotations[imgId];
+    });
+
+    // 이전 이미지 배치 중, 이번 새 배치에도 없고 JSON 쪽에서도 안 쓰는 건 RAM에서 정리합니다.
+    // (같은 탭에서 여러 배치를 연속으로 작업해도 state.annotations가 계속 누적되지 않도록 —
+    // IndexedDB에 이미 저장된 내용은 전혀 안 지우고, 메모리에 올라온 것만 정리합니다)
+    const newIdSet = new Set(allIds);
+    let ramCleared = 0;
+    if (state.imageLoadedIds) {
+      state.imageLoadedIds.forEach((id) => {
+        if (!newIdSet.has(id) && !state.jsonLoadedIds.has(id)) {
+          delete state.annotations[id];
+          ramCleared++;
+        }
+      });
+    }
+    state.imageLoadedIds = newIdSet;
+
+    // 새 배치 중 아직 메모리에 없는 것만 IndexedDB에서 읽어옵니다(이미 있으면 — 같은 배치를
+    // 다시 불러온 경우 등 — 지금 메모리에 있는 걸 그대로 신뢰하고 덮어쓰지 않습니다).
+    const needFetch = allIds.filter((id) => !state.annotations[id]);
+    const fetched = needFetch.length ? await idbGetAnnotationsBulk(needFetch) : {};
+
+    let keptCount = 0;
+    allIds.forEach((imgId) => {
+      if (state.annotations[imgId]) { keptCount++; return; } // 이미 메모리에 있음
+      const raw = fetched[imgId];
+      let existing = null;
+      if (raw) { try { existing = JSON.parse(raw); } catch (e) { existing = null; } }
       const hasExistingWork = existing && (
         (existing.rois && existing.rois.length) ||
         (existing.status && existing.status !== 'pending' && existing.status !== 'not_started')
@@ -1191,7 +1371,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       if (hasExistingWork) keptCount++;
       state.annotations[imgId] = existing || {
         id: imgId, image_id: imgId, wound_id: resolveWoundIdForImage(imgId) || '',
-        rois: [], status: 'pending', clinician_reviewed: false
+        rois: [], status: 'pending', clinician_reviewed: false, _loadedStatus: 'pending'
       };
     });
 
@@ -1201,7 +1381,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const filterNote = state.jsonLoadedIds.size ? ` · JSON 매칭된 ${state.woundIds.length}건만 작업 대상으로 표시 중` : '';
     el.folderStatus.textContent = `${allIds.length}개 이미지 불러옴${filterNote}` +
       (keptCount ? ` · 기존 작업 ${keptCount}건 유지` : '') +
-      (duplicateIds.length ? ` · 중복 파일명 ${duplicateIds.length}건 제외` : '');
+      (duplicateIds.length ? ` · 중복 파일명 ${duplicateIds.length}건 제외` : '') +
+      (ramCleared ? ` · 이전 배치 ${ramCleared}건 메모리 정리` : '');
     el.emptyState.style.display = state.woundIds.length ? 'none' : 'flex';
     if (state.woundIds.length) loadCurrentImageState();
     renderAll();
@@ -1788,15 +1969,46 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     el.depthWarnPopup.style.display = 'none';
   };
 
-  function goToImageId(imgId) {
+  // 의료진/2차가 남긴 피드백(이미지 전체 재작업 사유 + ROI별 코멘트)을 한눈에 모아 보여줍니다.
+  // 지금까지는 ROI를 하나씩 클릭해야만 그 ROI의 코멘트가 보였는데, 상태와 무관하게
+  // (확정/수정확정 처리하면서 메모만 남긴 경우도 포함) 이미지를 열자마자 바로 보이게 합니다.
+  function renderFeedbackBanner() {
+    if (!el.feedbackBanner) return;
+    const imgId = currentImageId();
+    const ann = imgId ? state.annotations[imgId] : null;
+    const items = [];
+    if (ann && ann.review_comment && ann.review_comment.trim()) {
+      items.push({ label: '전체 재작업 사유', text: ann.review_comment.trim() });
+    }
+    (state.rois || []).forEach((r) => {
+      const c = r.unc && r.unc.clinician_comment;
+      if (c && c.trim()) items.push({ label: r.name || r.id, text: c.trim() });
+    });
+    const dismissed = state.feedbackBannerDismissedId === imgId;
+    if (items.length && !dismissed) {
+      el.feedbackBannerBody.innerHTML = items.map((it) =>
+        `<div class="fbItem"><div class="fbItemLabel">${escapeHtml(it.label)}</div><div>${escapeHtml(it.text)}</div></div>`
+      ).join('');
+      el.feedbackBanner.classList.add('show');
+    } else {
+      el.feedbackBanner.classList.remove('show');
+    }
+  }
+  if (el.feedbackBannerCloseBtn) el.feedbackBannerCloseBtn.onclick = () => {
+    state.feedbackBannerDismissedId = currentImageId();
+    el.feedbackBanner.classList.remove('show');
+  };
+
+  async function goToImageId(imgId) {
     const bad = findRejectedWithoutComment();
     if (bad) {
-      alert('재작업 요청(' + bad.name + ')에 사유가 입력되지 않았습니다.\n코멘트를 입력한 뒤 이동해 주세요.');
-      state.selectedId = bad.id;
-      renderAll(); setTimeout(renderClinicianFields, 0);
+      alert(bad.missingReason
+        ? '재작업 요청에 "전체 재작업 사유"가 선택되지 않았습니다.\n드롭다운에서 사유를 선택한 뒤 이동해 주세요.'
+        : '재작업 요청(' + bad.name + ')에 사유가 입력되지 않았습니다.\n코멘트를 입력한 뒤 이동해 주세요.');
+      focusMissingReworkInput(bad);
       return;
     }
-    flushPendingSave();
+    await flushAllPendingSaves();
     for (let wi = 0; wi < state.woundIds.length; wi++) {
       const wid = state.woundIds[wi];
       const files = state.imagesByWound[wid] || [];
@@ -1826,36 +2038,75 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
   // 재작업(rejected) 판정인데 코멘트가 비어있는 ROI를 찾음 — 검수통과 버튼뿐 아니라
   // 다른 이미지로 넘어갈 때도 이 검증을 걸기 위해 공용 함수로 분리
+  // ROI별 재작업 판정(의료진 모드)뿐 아니라, 맨 위 "재작업" 버튼(2차 검수자 경로)으로
+  // rework_required가 됐는데 코멘트가 비어있는 경우도 같이 잡습니다.
   function findRejectedWithoutComment() {
-    return (state.rois || []).find(r => r.unc && r.unc.clinician === 'rejected' && !r.unc.clinician_comment);
+    const badRoi = (state.rois || []).find(r => r.unc && r.unc.clinician === 'rejected' && !r.unc.clinician_comment);
+    if (badRoi) return badRoi;
+    const imgId = currentImageId();
+    const ann = imgId ? state.annotations[imgId] : null;
+    if (ann && ann.status === 'rework_required') {
+      // "재작업 사유" 드롭다운은 모드와 무관하게 항상 선택이 필요합니다.
+      if (!ann.rework_reason) {
+        return { name: '이미지 전체', isWholeImage: true, missingReason: true };
+      }
+      // 코멘트(자유 서술)는 2차 검수 모드에서만 추가로 필요합니다 — 의료진 모드는
+      // 그 입력창 자체를 화면에서 숨기고 있어서(ROI별 코멘트로 대체) 제외합니다.
+      const hasComment = !!(ann.review_comment && ann.review_comment.trim());
+      if (state.userMode !== 'clinician' && !hasComment) {
+        return { name: '이미지 전체', isWholeImage: true };
+      }
+    }
+    return null;
   }
 
-  function goToWound(idx) {
+  // 이동이 막혔을 때, 어디를 고쳐야 하는지 바로 보이도록 스크롤 + 강조합니다.
+  function focusMissingReworkInput(bad) {
+    if (bad && bad.missingReason) {
+      const sel = document.getElementById('reworkReason');
+      if (sel) {
+        sel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        sel.classList.add('reworkReasonFlash');
+        setTimeout(() => sel.classList.remove('reworkReasonFlash'), 1200);
+        setTimeout(() => sel.focus(), 300);
+      }
+      return;
+    }
+    if (bad && bad.id) {
+      state.selectedId = bad.id;
+      renderAll();
+      setTimeout(renderClinicianFields, 0);
+    }
+  }
+
+  async function goToWound(idx) {
     if (idx < 0 || idx >= state.woundIds.length) return;
     const bad = findRejectedWithoutComment();
     if (bad) {
-      alert('재작업 요청(' + bad.name + ')에 사유가 입력되지 않았습니다.\n코멘트를 입력한 뒤 이동해 주세요.');
-      state.selectedId = bad.id;
-      renderAll(); setTimeout(renderClinicianFields, 0);
+      alert(bad.missingReason
+        ? '재작업 요청에 "전체 재작업 사유"가 선택되지 않았습니다.\n드롭다운에서 사유를 선택한 뒤 이동해 주세요.'
+        : '재작업 요청(' + bad.name + ')에 사유가 입력되지 않았습니다.\n코멘트를 입력한 뒤 이동해 주세요.');
+      focusMissingReworkInput(bad);
       return;
     }
-    flushPendingSave();
+    await flushAllPendingSaves();
     state.currentIndex = idx;
     state.currentImageIndex = 0;
     loadCurrentImageState();
   }
 
-  function goToImage(newIndex) {
+  async function goToImage(newIndex) {
     const files = state.imagesByWound[currentWoundId()] || [];
     if (newIndex < 0 || newIndex >= files.length) return;
     const bad = findRejectedWithoutComment();
     if (bad) {
-      alert('재작업 요청(' + bad.name + ')에 사유가 입력되지 않았습니다.\n코멘트를 입력한 뒤 이동해 주세요.');
-      state.selectedId = bad.id;
-      renderAll(); setTimeout(renderClinicianFields, 0);
+      alert(bad.missingReason
+        ? '재작업 요청에 "전체 재작업 사유"가 선택되지 않았습니다.\n드롭다운에서 사유를 선택한 뒤 이동해 주세요.'
+        : '재작업 요청(' + bad.name + ')에 사유가 입력되지 않았습니다.\n코멘트를 입력한 뒤 이동해 주세요.');
+      focusMissingReworkInput(bad);
       return;
     }
-    flushPendingSave();
+    await flushAllPendingSaves();
     state.currentImageIndex = newIndex;
     loadCurrentImageState();
   }
@@ -1872,6 +2123,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     normalizeRoiStructure();
     state.needsDefaultInit = !!imgId && !saved;
     state.depthWarnDismissedId = null;
+    state.feedbackBannerDismissedId = null;
     state.selectedId = null;
     renderMeta(wid);
     loadImageForCurrentWound();
@@ -2027,11 +2279,18 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     ).join('');
   }
 
+  // 지금 화면에 표시 중인 이미지의 Blob URL을 기억해둡니다. 이미지를 넘길 때마다
+  // URL.createObjectURL로 새 주소를 만드는데, 예전 것을 해제(revoke)하지 않으면
+  // 그 이미지의 디코딩된 원본 데이터가 메모리에 계속 쌓입니다 (1000건 작업 시
+  // 수백 MB~수 GB까지 누적되어 브라우저가 멈추는 원인으로 확인됨).
+  let currentImageObjectUrl = null;
+
   function loadImageForCurrentWound() {
     const f = currentImageFile();
     const files = state.imagesByWound[currentWoundId()] || [];
     if (!f) {
       el.stageImg.removeAttribute('src');
+      if (currentImageObjectUrl) { URL.revokeObjectURL(currentImageObjectUrl); currentImageObjectUrl = null; }
       el.imageInfoCard.innerHTML = `<div class="cardRow"><span class="k">상태</span><span class="v">이미지 없음</span></div>`;
       return;
     }
@@ -2081,6 +2340,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         el.readoutDims.textContent = `${state.imgNaturalW} × ${state.imgNaturalH}`;
         renderImageInfoCard(f, files.length, `${state.imgNaturalW} × ${state.imgNaturalH}`);
       };
+      // 새 이미지가 화면에 설정되는 이 시점에, 이전 이미지의 Blob URL을 해제합니다.
+      // (이미 화면에 다 그려졌던 것이라 이 시점에 해제해도 지금 보이는 화면엔 영향 없음)
+      if (currentImageObjectUrl && currentImageObjectUrl !== url) URL.revokeObjectURL(currentImageObjectUrl);
+      currentImageObjectUrl = url;
       el.stageImg.src = url;
     });
   }
@@ -2851,7 +3114,18 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   /* ============================================================
      ROI 목록 렌더링 (좌측 그룹/서브 목록)
      ============================================================ */
+  // el.roiListBody(고정 컨테이너)에 매번 새로 붙이는 pointermove/up/cancel 리스너를
+  // 추적해서, 다시 그릴 때마다 이전 것을 먼저 떼어냅니다. 안 그러면 이미지를 넘길
+  // 때마다(renderRoiList 호출마다) 리스너가 계속 쌓여서 메모리가 선형으로 늘어납니다
+  // (1000건 작업 시 수 GB까지 누적되는 것으로 확인됨).
+  let _roiListPointerMoveHandler = null;
+  let _roiListPointerUpHandler = null;
+  let _roiListPointerCancelHandler = null;
+
   function renderRoiList() {
+    if (_roiListPointerMoveHandler) el.roiListBody.removeEventListener('pointermove', _roiListPointerMoveHandler);
+    if (_roiListPointerUpHandler) el.roiListBody.removeEventListener('pointerup', _roiListPointerUpHandler);
+    if (_roiListPointerCancelHandler) el.roiListBody.removeEventListener('pointercancel', _roiListPointerCancelHandler);
     const tops = state.rois.filter((r) => r.roiType === 'ROI');
     const ignores = state.rois.filter((r) => r.roiType === 'Ignore');
     el.roiCountTop.textContent = state.rois.length;
@@ -2911,7 +3185,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         row.classList.add('dragging');
       });
     });
-    el.roiListBody.addEventListener('pointermove', (e) => {
+    _roiListPointerMoveHandler = (e) => {
       if (!dragState || e.pointerId !== dragState.pointerId) return;
       e.preventDefault();
       autoScrollList(e.clientY);
@@ -2922,7 +3196,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         const ratio = (e.clientY - rect.top) / rect.height;
         row.classList.add(ratio < .33 ? 'drop-before' : ratio > .67 ? 'drop-after' : 'drop-parent');
       }
-    });
+    };
     const endDrag = (e) => {
       if (!dragState || e.pointerId !== dragState.pointerId) return;
       const row = rowAtPoint(e.clientX, e.clientY);
@@ -2937,8 +3211,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         if (moveRoiByDrop(dragId, row.dataset.roi, mode)) { touch(); renderAll(); } else state.history.pop();
       }
     };
-    el.roiListBody.addEventListener('pointerup', endDrag);
-    el.roiListBody.addEventListener('pointercancel', endDrag);
+    _roiListPointerUpHandler = endDrag;
+    _roiListPointerCancelHandler = endDrag;
+    el.roiListBody.addEventListener('pointermove', _roiListPointerMoveHandler);
+    el.roiListBody.addEventListener('pointerup', _roiListPointerUpHandler);
+    el.roiListBody.addEventListener('pointercancel', _roiListPointerCancelHandler);
   }
 
   function worstUncLevel(unc) {
@@ -3068,7 +3345,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
               const ann = state.annotations[imgId];
               if (ann && ann.review_flag !== 'excluded') {
                 ann.review_flag = computeAutoReviewFlag(state.rois);
-                persistAllAnnotations();
+                persistAnnotation(imgId);
               }
             }
             renderReviewPanel();
@@ -3094,7 +3371,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       if (ann.review_flag !== 'excluded') {
         ann.review_flag = computeAutoReviewFlag(ann.rois);
       }
-      persistAllAnnotations();
+      persistAnnotation(imgId);
     }
     pendingSave = false;
     el.saveStatusText.textContent = '저장됨 · 방금';
@@ -3112,6 +3389,15 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     if (!pendingSave) return;
     clearTimeout(saveTimer);
     writeCurrentAnnotation();
+  }
+
+  // 다운로드·이미지 이동·새 배치 불러오기처럼 "지금 당장 최신 데이터가 필요한" 동작
+  // 직전에 반드시 호출합니다. 폴리곤 자동저장(500ms)과 코멘트 자동저장(400ms) 타이머를
+  // 전부 즉시 실행하고, IndexedDB 저장 큐가 실제로 다 끝날 때까지 기다립니다.
+  async function flushAllPendingSaves() {
+    flushPendingCommentSave();
+    flushPendingSave();
+    await flushAnnotationQueueAndWait();
   }
 
   /* ============================================================
@@ -3132,7 +3418,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       }
       if (ann.review_flag !== 'excluded') ann.review_flag = computeAutoReviewFlag(ann.rois);
       if (!ann.image_meta) ann.image_meta = null;
-      persistAllAnnotations();
+      persistAnnotation(imgId);
     }
     updateProgress();
     renderWorkPanel();
@@ -3258,14 +3544,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     });
     return rows;
   }
-  function buildCurrentJsonEntry() {
-    flushPendingSave();
+  async function buildCurrentJsonEntry() {
+    await flushAllPendingSaves();
     const imgId = currentImageId();
     if (!imgId) return null;
     return buildJsonEntries().find((entry) => entry.id === imgId) || null;
   }
-  el.exportJsonBtn.onclick = () => {
-    const entry = buildCurrentJsonEntry();
+  el.exportJsonBtn.onclick = async () => {
+    const entry = await buildCurrentJsonEntry();
     if (!entry) { alert('현재 저장할 이미지가 없습니다.'); return; }
     if (!REVIEW_DECIDED_STATUSES.includes(entry.status)) {
       alert('아직 미검수 상태입니다.\n검수통과/의료진검토/재작업/제외 중 하나로 처리한 뒤 다운로드해 주세요.');
@@ -3273,10 +3559,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     }
     downloadText(entry.id + '.json', JSON.stringify(entry, null, 1), 'application/json');
     markBackedUp(entry);
-    persistAllAnnotations();
+    persistAnnotation(entry.id);
   };
   el.exportZipBtn.onclick = async () => {
-    flushPendingSave();
+    await flushAllPendingSaves();
     const all = buildJsonEntries();
     const reviewed = all.filter(e => REVIEW_DECIDED_STATUSES.includes(e.status));
     const skipped  = all.filter(e => !REVIEW_DECIDED_STATUSES.includes(e.status));
@@ -3293,7 +3579,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
     downloadBlob('review_' + new Date().toISOString().slice(0,10) + '.zip', blob);
     reviewed.forEach(markBackedUp);
-    persistAllAnnotations();
+    reviewed.forEach((entry) => persistAnnotation(entry.id));
+    await flushAnnotationQueueAndWait();
     const bodyMsg = skipped.length > 0
       ? '✅ 저장됨: ' + reviewed.length + '건\n⏭ 미검수 제외: ' + skipped.length + '건\n\n미검수 항목은 ZIP에 포함되지 않았습니다.'
       : '✅ 전체 ' + reviewed.length + '건 모두 저장됨.';
@@ -3311,9 +3598,17 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
   // 엑셀에 바로 붙여넣기 좋게, 이미지id와 상태를 탭으로 구분해서 클립보드에 복사합니다.
   // 다운로드에 실제로 포함됐는지와 무관하게, 지금 로컬에 있는 전체 이미지 상태를 id순으로 전부 담습니다.
+  // 엑셀/구글시트에 이어붙이기 좋게 4열로 복사합니다:
+  // 이미지id / 상태 / 검수여부(Y=불러온 시점 상태값과 지금이 다름) / 피드백(재작업 상태일 때 코멘트)
   if (el.copyStatusListBtn) el.copyStatusListBtn.onclick = async () => {
     const all = buildJsonEntries().slice().sort((a, b) => a.id.localeCompare(b.id));
-    const lines = all.map((e) => e.id + '\t' + (STATUS_LABELS[e.status] || e.status || ''));
+    const flatten = (s) => (s || '').replace(/\t/g, ' ').replace(/\r?\n/g, ' / ').trim();
+    const lines = all.map((e) => {
+      const ann = state.annotations[e.id] || {};
+      const workDone = ('_loadedStatus' in ann) && ann._loadedStatus !== e.status ? 'Y' : 'N';
+      const feedback = (e.status === 'rework_required' && ann.review_comment) ? flatten(ann.review_comment) : '';
+      return [e.id, (STATUS_LABELS[e.status] || e.status || ''), workDone, feedback].join('\t');
+    });
     const text = lines.join('\n');
     try {
       await navigator.clipboard.writeText(text);
@@ -3334,7 +3629,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       '정말로 전체 초기화하시겠습니까?'
     );
     if (!ok) return;
-    try { await idbRemove(LS_KEY); } catch (e) {}
+    try { await idbRemove(LS_KEY); } catch (e) {} // 예전 방식(전체를 한 키에) 잔여 데이터
+    try { await idbClearAllAnnotations(); } catch (e) {} // 지금 방식(이미지별 키) 데이터
     try { localStorage.removeItem(LS_KEY); } catch (e) {} // 혹시 남아있는 예전 데이터도 같이 정리
     location.reload();
   };
@@ -3379,8 +3675,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       '</div>'
     ).join('');
     el.workListBody.querySelectorAll('[data-work-id]').forEach((btn) => {
-      btn.onclick = () => {
-        if (!goToImageId(btn.dataset.workId)) alert('해당 이미지를 현재 불러온 폴더에서 찾지 못했습니다.');
+      btn.onclick = async () => {
+        if (!(await goToImageId(btn.dataset.workId))) alert('해당 이미지를 현재 불러온 폴더에서 찾지 못했습니다.');
         el.workPanel.classList.remove('show');
       };
     });
@@ -3446,10 +3742,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         '<button data-sosgo="' + escapeHtml(id) + '" title="이동">→</button></div>';
     }).join('');
     el.sosListBody2.querySelectorAll('[data-sosjump],[data-sosgo]').forEach((node) => {
-      node.onclick = (e) => {
+      node.onclick = async (e) => {
         e.stopPropagation();
         const id = node.dataset.sosjump || node.dataset.sosgo;
-        if (!goToImageId(id)) { alert('해당 이미지를 현재 불러온 폴더에서 찾지 못했습니다.'); return; }
+        if (!(await goToImageId(id))) { alert('해당 이미지를 현재 불러온 폴더에서 찾지 못했습니다.'); return; }
         el.sosPanel.classList.remove('show');
       };
     });
@@ -3464,13 +3760,13 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     if (!ok && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
   }
 
-  el.reviewBtn.onclick = () => {
+  el.reviewBtn.onclick = async () => {
     const imgId = currentImageId(); if (!imgId) return;
-    flushPendingSave();
+    await flushAllPendingSaves();
     const ann = state.annotations[imgId] = state.annotations[imgId] || {};
     ann.wound_id = currentWoundId();
     ann.review_flag = ann.review_flag === 'unconfirmed' ? null : 'unconfirmed';
-    persistAllAnnotations();
+    persistAnnotation(imgId);
     renderSosPanel();
   };
   el.exclusionReasonSelect.innerHTML = EXCLUSION_REASONS.map(([v, t]) => '<option value="' + v + '">' + t + '</option>').join('');
@@ -3489,7 +3785,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     ann.rois = [];   // 제외 이미지에는 폴리곤 보관하지 않음
     state.rois = []; // 화면에서도 즉시 제거
     state.selectedId = null;
-    persistAllAnnotations();
+    persistAnnotation(imgId);
     renderWorkPanel();
     el.excludePanel.classList.remove('show');
     renderSosPanel();
@@ -3575,6 +3871,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   function renderAll() {
     renderWorkPanel();
     renderDepthWarning();
+    renderFeedbackBanner();
     if (typeof renderClinicianFields === 'function') renderClinicianFields();
     el.selectModeBtn.classList.toggle('active', state.mode === 'select');
     el.drawModeBtn.classList.toggle('active', state.mode === 'draw');
@@ -3675,7 +3972,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     if (ann.status !== 'rework_required') {
       ann.rework_reason = null; ann.review_comment = null; ann.review_source = null;
     }
-    persistAllAnnotations();
+    persistAnnotation(imgId);
     renderReviewPanel();
     updateProgress();
     if (typeof renderImageList === 'function') renderImageList();
@@ -3745,9 +4042,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   if (_confirmBtn) _confirmBtn.onclick = () => {
     const bad = findRejectedWithoutComment();
     if (bad) {
-      alert('재작업 요청(' + bad.name + ')에 사유가 입력되지 않았습니다.');
-      state.selectedId = bad.id;
-      renderAll(); setTimeout(renderClinicianFields, 0);
+      alert(bad.missingReason
+        ? '재작업 요청에 "전체 재작업 사유"가 선택되지 않았습니다.\n드롭다운에서 사유를 선택한 뒤 이동해 주세요.'
+        : '재작업 요청(' + bad.name + ')에 사유가 입력되지 않았습니다.');
+      focusMissingReworkInput(bad);
       return;
     }
     setReviewStatus('confirmed');
@@ -3758,7 +4056,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const imgId = currentImageId(); if (!imgId) return;
     const ann = state.annotations[imgId] = state.annotations[imgId] || {};
     ann.exclusion_reason = _excReason.value || null;
-    persistAllAnnotations();
+    persistAnnotation(imgId);
   };
 
   /* 재작업 사유/코멘트 저장 (드롭다운·textarea 변경 시 자동 호출) */
@@ -3766,11 +4064,19 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const imgId = currentImageId(); if (!imgId) return;
     const ann = state.annotations[imgId] = state.annotations[imgId] || {};
     ann.status = 'rework_required';
-    ann.review_source = 'secondary_reviewer';
+    // 실제 판정 주체를 정확히 남깁니다 — 의료진 모드에서 고른 재작업인데
+    // 2차 검수자가 한 것처럼 기록되면 안 됩니다.
+    ann.review_source = state.userMode === 'clinician' ? 'clinician' : 'secondary_reviewer';
     ann.clinician_reviewed = true;
     ann.rework_reason = _reworkReason ? (_reworkReason.value || null) : null;
-    ann.review_comment = _reworkComment ? (_reworkComment.value || null) : null;
-    persistAllAnnotations();
+    // 의료진 모드에서는 맨 위 코멘트 textarea가 화면에 숨겨져 있어서(ROI별 코멘트로
+    // 대체) 그 값(보통 비어있음)으로 덮어쓰면 안 됩니다. ROI 코멘트 기반으로 다시
+    // 합성합니다 — 안 그러면 "ROI 코멘트를 먼저 쓰고 사유를 나중에 고르는" 순서에서
+    // 방금 입력한 코멘트가 사라지는 문제가 있었습니다.
+    ann.review_comment = state.userMode === 'clinician'
+      ? buildConcatenatedReworkComment(state.rois)
+      : (_reworkComment ? (_reworkComment.value || null) : null);
+    persistAnnotation(imgId);
     renderReviewPanel();
     updateProgress();
     if (typeof renderImageList === 'function') renderImageList();
@@ -3786,15 +4092,15 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       ann.rework_reason = null;
       ann.review_comment = null;
       ann.review_source = null;
-      persistAllAnnotations();
+      persistAnnotation(imgId);
       renderReviewPanel();
       updateProgress();
       if (typeof renderImageList === 'function') renderImageList();
     } else {
       ann.status = 'rework_required';
-      ann.review_source = 'secondary_reviewer';
+      ann.review_source = state.userMode === 'clinician' ? 'clinician' : 'secondary_reviewer';
       ann.clinician_reviewed = true;
-      persistAllAnnotations();
+      persistAnnotation(imgId);
       renderReviewPanel();
       updateProgress();
       if (typeof renderImageList === 'function') renderImageList();
@@ -3807,7 +4113,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     el.style.height = el.scrollHeight + 'px';
   }
   if (_reworkReason)  _reworkReason.onchange = saveReworkStatus;
-  if (_reworkComment) _reworkComment.oninput = () => { autoExpandTextarea(_reworkComment); saveReworkStatus(); };
+  if (_reworkComment) _reworkComment.oninput = () => { autoExpandTextarea(_reworkComment); scheduleCommentSave(saveReworkStatus); };
 
   /* 의료진 판정 필드 렌더링 */
   function renderClinicianFields() {
@@ -3855,7 +4161,28 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       ta.oninput = function() {
         if (!sel.unc || typeof sel.unc !== 'object') sel.unc = defaultUnc();
         sel.unc.clinician_comment = ta.value.trim() || null;
-        persistAllAnnotations();
+        // 코멘트를 쓴 "이미지 + 그 ROI"를 지금 이 순간 캡처해둡니다. 디바운스 콜백은
+        // 400ms 뒤에 실행되는데, 그 사이 사용자가 다른 이미지로 넘어가면 state.rois는
+        // 이미 그 다른 이미지의 ROI로 바뀌어 있습니다. 콜백 안에서 "그때의 state.rois
+        // 전체"를 그대로 ann.rois에 덮어쓰면, A 이미지의 코멘트를 저장하려다가 B 이미지의
+        // ROI 전체로 A의 데이터를 뒤집어써버리는 심각한 교차 오염이 발생했습니다. 그래서
+        // 이제는 "그 ROI 하나"만 찾아서 코멘트만 갱신합니다 — 다른 ROI/다른 이미지는
+        // 절대 건드리지 않습니다.
+        const imgId = currentImageId();
+        const roiId = sel.id;
+        const comment = sel.unc.clinician_comment;
+        scheduleCommentSave(() => {
+          const ann = imgId ? state.annotations[imgId] : null;
+          if (!ann) return;
+          const targetRoi = (ann.rois || []).find((r) => r.id === roiId);
+          if (!targetRoi) return; // 그 사이 ROI가 지워졌거나 하는 등 예외적인 경우
+          if (!targetRoi.unc || typeof targetRoi.unc !== 'object') targetRoi.unc = defaultUnc();
+          targetRoi.unc.clinician_comment = comment;
+          if (ann.status === 'rework_required' && state.userMode === 'clinician') {
+            ann.review_comment = buildConcatenatedReworkComment(ann.rois);
+          }
+          persistAnnotation(imgId);
+        });
       };
     }
 
@@ -3871,7 +4198,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         if (!sel.unc || typeof sel.unc !== 'object') sel.unc = defaultUnc();
         sel.unc.truth_source = item[1];
         markClinReviewed(sel);
-        persistAllAnnotations();
+        persistAnnotation(currentImageId());
         renderClinicianFields();
       };
     });
@@ -3905,7 +4232,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         ann.review_comment = buildConcatenatedReworkComment(state.rois);
       }
     }
-    persistAllAnnotations();
+    persistAnnotation(imgId);
     if (typeof renderReviewPanel === 'function') renderReviewPanel();
     if (typeof renderImageList === 'function') renderImageList();
   }
@@ -4016,8 +4343,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     }).join('');
 
     body.querySelectorAll('.ilItem').forEach(node => {
-      node.onclick = () => {
-        flushPendingSave();
+      node.onclick = async () => {
+        await flushAllPendingSaves();
         state.currentIndex = +node.dataset.wi;
         state.currentImageIndex = 0;
         loadCurrentImageState();
@@ -4104,6 +4431,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           status: mappedIncomingStatus || 'pending',
           _fingerprint: newFingerprint,
           _modified: isModified,
+          _loadedStatus: mappedIncomingStatus || 'pending', // "전체 복사"의 검수여부(Y/N) 판단 기준선 — 새로 불러올 때마다 갱신
         });
         // 방금 불러온 파일은 그 자체로 이미 외부(1차/2차가 주고받은 원본 파일)에 존재하는
         // 안전한 사본이므로 백업 완료로 간주합니다. 다운로드를 안 해도 자동정리 대상이 됩니다.
@@ -4131,7 +4459,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       }
       state.jsonLoadedIds = newBatchIds;
     }
-    persistAllAnnotations();
+    newBatchIds.forEach((id) => persistAnnotation(id));
     if (state.allWoundIds.length) applyJsonMatchFilter(); // 이미지가 먼저 로드되어 있었으면 즉시 목록 범위 재조정
     const statusEl2 = document.getElementById('jsonFolderStatus');
     if (statusEl2) statusEl2.textContent = `이미지 파일명 일치 ${matched}건` +
@@ -4169,13 +4497,16 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   }
 
   async function loadUnifiedFileList(fileList, sourceLabel) {
+    // 새 배치를 불러오기 시작하기 전에, 지금 열려있던 이미지의 미반영 수정(폴리곤
+    // 자동저장·코멘트 debounce)을 전부 먼저 끝내둡니다.
+    await flushAllPendingSaves();
     el.unifiedLoadStatus.textContent = `${sourceLabel} 분석 중…`;
     const { images, excelFile, jsons } = classifyUnifiedFiles(fileList);
     const parts = [];
     // 엑셀을 먼저 읽어야 WOUND_MASTER 기준으로 이미지 매칭이 정확해짐, 그다음 이미지, 마지막 작업 JSON
     // (작업 JSON은 state.woundIds가 채워진 상태에서 매칭해야 정확하게 걸러짐)
     if (excelFile) { await loadExcelFile(excelFile); parts.push('엑셀 1건'); }
-    if (images.length) { loadImageFileList(images); parts.push(`이미지 ${images.length}개`); }
+    if (images.length) { await loadImageFileList(images); parts.push(`이미지 ${images.length}개`); }
     if (jsons.length) { await loadWorkJsonFileList(jsons); parts.push(`작업 JSON ${jsons.length}개`); }
     if (!excelFile && !images.length && !jsons.length) {
       el.unifiedLoadStatus.textContent = `${sourceLabel}에서 이미지(.jpg/.png 등)·엑셀(.xlsx)·작업 JSON(.json) 파일을 찾지 못했습니다`;
@@ -4224,10 +4555,12 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
   el.imageInfoCard.innerHTML = `<div class="cardRow"><span class="k">상태</span><span class="v">불러오는 중…</span></div>`;
   el.metaCard.innerHTML = `<div class="cardRow"><span class="k">상태</span><span class="v">불러오는 중…</span></div>`;
-  // IndexedDB에서 저장된 작업 데이터를 비동기로 불러온 뒤 화면을 그립니다.
-  // (보통 수십 ms 이내로 끝나서 체감상 거의 즉시 뜨는 것과 차이가 없습니다)
+  // 예전엔 시작할 때 저장된 전체 작업 데이터를 전부 불러왔는데, 이제는 이미지 단위
+  // 저장 방식이라 그럴 필요가 없습니다 — 필요한 데이터는 이미지 폴더를 불러오는 시점에
+  // 그 배치 분량만 가져옵니다. 시작할 때는 예전 방식 데이터가 남아있으면 한 번만
+  // 새 방식으로 이관하는 마이그레이션만 수행합니다 (보통 수십~수백 ms 이내).
   (async function initFromIndexedDB() {
-    state.annotations = await loadAllAnnotationsAsync();
+    await migrateLegacyAnnotationsIfNeeded();
     el.imageInfoCard.innerHTML = `<div class="cardRow"><span class="k">상태</span><span class="v">대기 중</span></div>`;
     el.metaCard.innerHTML = `<div class="cardRow"><span class="k">상태</span><span class="v">대기 중</span></div>`;
     renderReviewPanel(); // 저장된 review_flag 즉시 반영
